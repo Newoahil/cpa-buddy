@@ -996,3 +996,21 @@ func withReset(rec state.CredentialRecord, resets map[string]time.Time) state.Cr
 	rec.LastResetAt = resets
 	return rec
 }
+
+// TestReportKeepsCollectorObservationTime: the OMC source stamps the real
+// observation instant; evaluation must not overwrite it with the cycle clock in
+// the report, even though the persisted record advances to the cycle time.
+func TestReportKeepsCollectorObservationTime(t *testing.T) {
+	eng := newEngine(t)
+	now := time.Date(2026, 6, 2, 0, 0, 0, 0, time.UTC)
+	observed := now.Add(-90 * time.Minute)
+	s := okSnap("k", domain.ProviderCodex, win("5h", 10))
+	s.LastSuccessAt = observed
+	report, _, next := eng.Evaluate(bootstrapped(), []domain.QuotaSnapshot{s}, now)
+	if got := report.Providers[0].Snapshots[0].LastSuccessAt; !got.Equal(observed) {
+		t.Fatalf("report LastSuccessAt = %v, want the observation time %v", got, observed)
+	}
+	if got := next.Credentials["k"].LastSuccessAt; !got.Equal(now) {
+		t.Fatalf("persisted LastSuccessAt = %v, want the cycle time %v", got, now)
+	}
+}

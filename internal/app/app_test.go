@@ -517,3 +517,27 @@ func TestSendSummaryMarksDegradedFallback(t *testing.T) {
 		t.Error("fallback summary should carry a note")
 	}
 }
+
+func TestNextPollWaitSuppressesFastPollDuringFallback(t *testing.T) {
+	cfg := testConfig()
+	cfg.PollInterval = 15 * time.Minute
+	cfg.FastPollInterval = 3 * time.Minute
+	engine := evaluate.New(cfg, nil)
+	a := New(cfg, nil, engine, newMemStore(), nil)
+	used := 95.0
+	rep := domain.Report{Providers: []domain.ProviderReport{{
+		Provider:  domain.ProviderCodex,
+		Snapshots: []domain.QuotaSnapshot{{OK: true, Windows: []domain.QuotaWindow{{UsedPercent: &used}}}},
+	}}}
+	if got := a.nextPollWait(rep); got != 3*time.Minute {
+		t.Fatalf("normal fast poll = %v, want 3m", got)
+	}
+	a.SetFallbackActive(func() bool { return true })
+	if got := a.nextPollWait(rep); got != 15*time.Minute {
+		t.Fatalf("fallback poll = %v, want the regular 15m", got)
+	}
+	a.SetFallbackActive(func() bool { return false })
+	if got := a.nextPollWait(rep); got != 3*time.Minute {
+		t.Fatalf("recovered fast poll = %v, want 3m", got)
+	}
+}

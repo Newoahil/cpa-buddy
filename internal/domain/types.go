@@ -28,6 +28,9 @@ const (
 	// SourceCPA is the official CPA v8 management API.
 	SourceCPA   Source = "cpa-v8"
 	SourceCPAV0 Source = "cpa-v0"
+	// SourceOMC is quota read from Oh My CPA's read-only MCP endpoint. OMC is
+	// the only party actively refreshing upstream quota when it is enabled.
+	SourceOMC Source = "omc"
 	// SourceOllamaWeb is the unofficial ollama.com settings page scrape.
 	SourceOllamaWeb Source = "ollama-web"
 )

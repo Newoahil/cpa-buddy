@@ -24,6 +24,10 @@ CPA 额度观察与通知 sidecar：状态页、Feishu 和可选 webhook，支�
 | `ANTIGRAVITY_QUOTA_PROFILE` | `current` | `current`、`legacy`，独立于管理版本 |
 | `CPA_TIMEOUT` | `20s` | 单个管理请求超时 |
 | `CPA_CONTEXT_OVERRIDES_JSON` | 空 | 按 opaque Credential Key 绑定 `account_id` / `project_id`，仅 sidecar 内存 |
+| `QUOTA_SOURCE` | `cpa` | `cpa` 直接查 CPA 管理 API（现状）；`omc` 改从 OMC 只读 MCP 读取已采集额度 |
+| `OMC_MCP_URL` | 空 | `QUOTA_SOURCE=omc` 时必填；OMC 的 Streamable HTTP MCP 地址，如 `http://omc:8080/omc/api/mcp` |
+| `OMC_MCP_KEY` | 空 | `QUOTA_SOURCE=omc` 时必填；OMC 只读 bearer key。属密钥：不记录、不渲染、不落盘，错误信息只报设置名 |
+| `OMC_FALLBACK_AFTER` | `3` | OMC 连续失败达到该次数后，回退为直接查 CPA；每轮先试 OMC，恢复后自动切回 |
 | `POLL_INTERVAL` | `15m` | 自动采集周期，至少一分钟 |
 | `LOG_DIR` / `LOG_FILE_MAX_MB` / `LOG_FILE_KEEP` | `/data/logs` / `10` / `10` | 日志另存一份到持久卷并按大小轮转（容器日志只保留很短一段）；`LOG_DIR=off` 关闭。查看：在容器终端执行 `tail -n 200 /data/logs/cpa-manager.log` |
 | `FAST_POLL_INTERVAL` | `3m` | 有账号用量超过提醒线时改用的采集周期；`0` 关闭，否则至少 `1m` |
@@ -132,6 +136,41 @@ episode 计时只保存在内存，重启会重新计时（重启期间已结束
 fraction 不截断为耗尽。生产路径不使用启发式百分比猜测。上游 401 表示凭证
 拒绝；403 权限原因未知、429 限流及 5xx 都不会被武断认定额度耗尽或凭证过期。
 v0/v8 来源分别记录为 `cpa-v0`/`cpa-v8`。
+
+## OMC 额度来源（`QUOTA_SOURCE=omc`）
+
+架构上 CPA 是唯一数据源，OMC 是唯一主动查询上游额度的一方，CPA-buddy 负责处理、
+预警、预测与播报。设 `QUOTA_SOURCE=omc` 后，CPA-buddy 不再向 CPA 查 CPA 渠道额度，
+改从 OMC 的只读 MCP 端点读取 OMC 已采集的结果；Ollama 仍由 CPA-buddy 自行采集，不变。
+
+- 最小 MCP 客户端：JSON-RPC over HTTP POST，握手 `initialize` → `notifications/initialized`
+  → `tools/call`，`Accept: application/json, text/event-stream`，Bearer 只读 key。
+  优先解析 `result.structuredContent`，缺失时回退 `content[0].text` 的 JSON；
+  处理 JSON-RPC error 与 `isError`；协议版本 `2025-03-26`（OMC 支持）。OMC 端为无状态
+  JSON 响应，客户端缓存协商出的协议版本，不新增第三方依赖。
+- 使用工具 `quota_list`：每个 item 含 `auth_index`、`provider`、`status`、`plan`、
+  `windows[]`（`id`/`label`/`kind`/`scope`/`model`/`used_percent`/`reset_at_ms`/
+  `period_hours`/`reset_accuracy`…）与 `observed_at_ms`。
+- **身份关联**：继续用 CPA 管理接口 `ListCredentials`（非上游额度查询，冷却巡检每 60s
+  已在调用）提供 `Credential.Key`/`Alias` 等身份与别名，再按 `auth_index` 关联 OMC
+  的额度。CPA-buddy 的 `Credential.Key` 是 `provider + "/" + hex(SHA256(provider + ":" +
+  auth_index))[:16]` 的 opaque 值，只由 provider 与 auth_index 决定，与 OMC 的
+  `auth_index`（同样取自 CPA 凭证列表的 handle）一一对应；因此切换数据源不会重置状态、
+  也不会让别名退化成掩码邮箱。仅处理 CPA 渠道（`codex`/`claude`/`antigravity`/
+  `gemini-cli`）。
+- 字段语义与现有 `CPACollector` 保持一致：`Windows` 的 `Name`/`Label`/`Scope`/`ScopeID`/
+  `UsedPercent`/`ResetAt`/`WindowSeconds`、`Plan`；`FetchedAt`/`LastSuccessAt` 用 OMC 的
+  `observed_at_ms`（观测时间）而非采集时刻，`Stale`/`OK`/`Failure` 由 OMC `status` 映射。
+  OMC `scope` 的 `standard`→账号、`model`→模型、`group`→分组（`code_review` 记为分组）。
+- OMC 中不存在的凭据，或 OMC 不支持刷新的 provider（如 Gemini CLI），按「未上报/不可用」
+  处理（`unsupported`，不臆造数字），由既有引擎按缺测保留旧证据推进过期判定。
+- **回退**：`QUOTA_SOURCE=omc` 时每轮先试 OMC；连续失败达 `OMC_FALLBACK_AFTER` 后，
+  该轮改为直接查 CPA 并记一条明确日志/状态；OMC 恢复后自动切回。回退期间抑制全局 3 分钟
+  快速轮询，改用常规 `POLL_INTERVAL`，避免直接查上游变密。回退仍复用现有 `CPACollector`，
+  因此预警/通知规则、日报、history JSONL 格式都不变。
+
+OMC 接口属于另一条线的能力（`quota_list` 及其只读 key）；实际内网地址需按部署环境提供，
+本仓库不做发现。
 
 ## 行为边界与验证
 

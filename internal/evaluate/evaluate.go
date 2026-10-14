@@ -178,7 +178,14 @@ func (e *Engine) evaluateCredential(rec state.CredentialRecord, snap domain.Quot
 		out.CapabilityUnavailable = false
 		out.ConsecutiveFailures = 0
 		out.LastSuccessAt = now
-		snap.LastSuccessAt = now
+		// A collector may have already stamped the real observation instant
+		// (the OMC source reads OMC's observed_at_ms, not the cycle clock). Only
+		// fill it in when it is absent, so a reader is never shown a stale
+		// reading dated now. The persisted record still advances to the cycle
+		// time, preserving the existing staleness rules.
+		if snap.LastSuccessAt.IsZero() {
+			snap.LastSuccessAt = now
+		}
 		reportSnap = snap
 
 		// Recompute explicit account applicability and independently evaluate

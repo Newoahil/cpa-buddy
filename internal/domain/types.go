@@ -506,6 +506,31 @@ const (
 	AlertRateLimitCleared AlertKind = "rate_limit_cleared"
 )
 
+// Actionable-mode kinds. These are produced by the push policy
+// (internal/notify/policy) rather than by the evaluation engine, except that
+// AlertCredential doubles as the credential_invalid pending kind.
+//
+// AlertChannelUnavailable and AlertMonitorDown are channel-level: their
+// Credential carries only the provider, because the condition is about the
+// whole channel, not one account.
+const (
+	// AlertChannelUnavailable: every enabled account of a channel is unusable
+	// and the earliest recovery lies beyond CHANNEL_UNAVAILABLE_AFTER.
+	AlertChannelUnavailable AlertKind = "channel_unavailable"
+	// AlertMonitorDown: a channel has produced no valid data for longer than
+	// MONITOR_DOWN_AFTER. It replaces the immediate suspect/stale alerts.
+	AlertMonitorDown AlertKind = "monitor_down"
+	// AlertOMCOutage is reserved for the OMC fallback source (feat/omc-quota-source).
+	// This branch has no FallbackCollector, so it is only ever used as a pending
+	// item kind, never pushed immediately.
+	AlertOMCOutage AlertKind = "omc_outage"
+	// AlertQuietDigest is the merged message sent when quiet hours end, carrying
+	// the still-unresolved events accumulated during quiet hours.
+	AlertQuietDigest AlertKind = "quiet_digest"
+	// AlertActionableSummary is the new scheduled digest card in actionable mode.
+	AlertActionableSummary AlertKind = "actionable_summary"
+)
+
 // Fact line prefixes emitted by the cooldown watcher on AlertRateLimited and
 // AlertRateLimitCleared alerts. Renderers parse these; the value follows the
 // prefix after one space.
@@ -640,4 +665,46 @@ type Message struct {
 	// Detailed requests the per-window expansion used by a single-channel
 	// query. The default compact form folds normal channels into one line.
 	Detailed bool `json:"detailed,omitempty"`
+	// Actionable, when set, selects the ALERT_MODE=actionable card view model.
+	// Its absence means the message renders exactly as before (legacy). It is
+	// the only place the new cards diverge, so the renderer can be polished
+	// without touching the policy that produced the classification.
+	Actionable *ActionableCard `json:"actionable,omitempty"`
+}
+
+// ActionableCard is the view model for the ALERT_MODE=actionable cards. It is a
+// pure projection: the policy decides what belongs here, the renderer decides
+// how it looks. Keeping it free of rendering concerns is what lets @designer
+// change the card without touching the classification.
+type ActionableCard struct {
+	// HeaderColor is the Feishu header template ("red"/"orange"/"blue"/...).
+	HeaderColor string
+	// Conclusion is the one-line verdict shown under the title.
+	Conclusion string
+	// Pending lists the open pending items (docs/alert-noise-plan.md §4).
+	Pending []PendingRow
+	// Tight lists the channels whose best usable account is running low; it is
+	// the reason a summary can be worth sending with no pending items.
+	Tight []TightChannel
+}
+
+// PendingRow is one open pending item as a card shows it.
+type PendingRow struct {
+	Kind     AlertKind
+	Provider ProviderKind
+	Alias    string
+	ShortID  string
+	Since    time.Time
+	Action   string
+}
+
+// TightChannel is one channel whose best usable account has a low remaining
+// share in some account-level window.
+type TightChannel struct {
+	Provider ProviderKind
+	// BestRemaining is the remaining percentage of the best usable account's
+	// tightest account-level window. Nil means no account-level reading exists.
+	BestRemaining *float64
+	// ResetAt is when that binding window refreshes.
+	ResetAt *time.Time
 }

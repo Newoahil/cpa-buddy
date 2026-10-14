@@ -34,6 +34,12 @@ CPA 额度观察与通知 sidecar：状态页、Feishu 和可选 webhook，支�
 | `QUOTA_THRESHOLD_NOTICE` / `_WARN` / `_URGENT` | `80` / `90` / `100` | 已用百分比阈值：提醒 / 告警 / 用满 |
 | `COOLDOWN_POLL_INTERVAL` | `60s` | 限流冷却巡检周期，仅读取凭证列表（不请求额度/上游）；`0` 关闭，否则至少 `15s` |
 | `COOLDOWN_ALERT_AFTER` | `30m` | 只有 CPA 给出的恢复时间在该时长之后才推送（超出 CPA 自身最长 30 分钟退避，基本是额度用满）；CPA 日常的短冷却一律不推送，只计入日报 |
+| `ALERT_MODE` | `actionable` | `actionable` 只即时推送需要人动手的事（凭据失效、渠道整体不可用、监控停摆）；`legacy` 完整还原旧行为，仅作回退开关 |
+| `CHANNEL_UNAVAILABLE_AFTER` | `30m` | 渠道（全部已启用账号不可用）最早恢复时间晚于该时长才推；仅模型/分组级耗尽、全部禁用不算 |
+| `MONITOR_DOWN_AFTER` | `30m` | 渠道连续拿不到有效数据超过该时长才推一次（替代即时的 `suspect`/`stale`）；抖动不推 |
+| `OMC_OUTAGE_PENDING_AFTER` | `2h` | OMC 中断超过该时长才列入「待处理」，不即时推（依赖 `feat/omc-quota-source`，本分支仅预留接口） |
+| `QUIET_HOURS` | `23:00-08:00` | 免打扰时段（可跨午夜，按 `TZ_NAME`）；期间即时推送先攒着，结束或恢复后合并发出；设空关闭 |
+| `SUMMARY_TIGHT_REMAINING` | `20` | 渠道紧张判定的剩余百分比，是定时汇总发送的条件之一 |
 | `QUOTA_HISTORY_DIR` | `<STATE_PATH 所在目录>/history` | 额度历史（append-only JSONL，按 `TZ_NAME` 的日界分文件），默认 `/data/history` |
 | `QUOTA_HISTORY_RETENTION` | `2160h` | 额度历史保留时长；启动与跨天时删除过期的整天文件（只按文件名日期，不动其它文件） |
 
@@ -44,6 +50,14 @@ CPA 额度观察与通知 sidecar：状态页、Feishu 和可选 webhook，支�
 episode 计时只保存在内存，重启会重新计时（重启期间已结束的告警不会补发 cleared）；被禁用或已删除
 的凭证不参与。CPA 的 `status_message` 可能含上游原文，**不会**被读取、存储、记录或渲染。额度接口返回
 429 仍不是结论（不判耗尽/失效），仅在快照上保留 `Code: "429"`。
+
+默认 `ALERT_MODE=actionable` 下即时推送只保留三类：凭据失效、渠道整体不可用
+（已启用账号全部不可用且最早恢复晚于 `CHANNEL_UNAVAILABLE_AFTER`）、监控停摆
+（渠道连续无有效数据超过 `MONITOR_DOWN_AFTER`，一次故障只推一次）。90%/95%
+阈值、单个账号用尽、刷新与恢复、短暂陈旧都不再即时推送：未解决的问题作为结构化
+「待处理项」存进状态文件，随定时汇总展示，解决后自动关闭。定时汇总仅在存在待处理项
+或渠道紧张（`SUMMARY_TIGHT_REMAINING`）时发送，免打扰期间跳过；`bootstrap_summary`
+不变。待处理项保留 7 天（已解决），旧状态文件可直接加载。
 
 完整配置见 `.env.example`。`QUOTA_THRESHOLDS_JSON` 可按 `codex`、`claude`、
 `gemini-cli`、`antigravity`、`ollama` 覆盖阈值。

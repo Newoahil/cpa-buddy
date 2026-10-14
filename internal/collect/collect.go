@@ -238,7 +238,9 @@ func failedOllamaSnapshot(account config.OllamaAccount, err error) domain.QuotaS
 // All assembles the collectors enabled by configuration.
 //
 // The Ollama collector is omitted entirely when no accounts are configured, so
-// nothing ever touches the Ollama website without an explicit opt-in.
+// nothing ever touches the Ollama website without an explicit opt-in. The CPA
+// channel likewise switches to the OMC source (with a direct-CPA fallback) when
+// QUOTA_SOURCE=omc; see Build.
 func All(cfg config.Config) []domain.Collector {
 	return AllWithCPA(cfg, NewCPAClient(cfg))
 }
@@ -255,11 +257,6 @@ func NewCPAClient(cfg config.Config) *cpa.Client {
 
 // AllWithCPA lets the watcher and collector share negotiation and HTTP state.
 func AllWithCPA(cfg config.Config, client *cpa.Client) []domain.Collector {
-	out := []domain.Collector{
-		NewCPACollector(client),
-	}
-	if len(cfg.OllamaAccounts) > 0 {
-		out = append(out, NewOllamaCollector(ollama.New(cfg.OllamaTimeout), cfg.OllamaAccounts))
-	}
-	return out
+	collectors, _ := Build(cfg, client, nil)
+	return collectors
 }

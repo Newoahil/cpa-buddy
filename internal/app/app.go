@@ -75,6 +75,12 @@ type App struct {
 	// here so app does not need to import the collect package.
 	controlPlaneErr error
 
+	// fallbackActive, when set, reports whether quota collection is currently
+	// reading CPA directly because the OMC source failed. It is consulted only
+	// by nextPollWait, to keep the fast poll from accelerating direct upstream
+	// quota queries during a fallback.
+	fallbackActive func() bool
+
 	now func() time.Time
 }
 
@@ -118,6 +124,12 @@ func (a *App) SetHistory(w *history.Writer) { a.history = w }
 // failures (for example collect.ErrControlPlane). A nil value disables the
 // distinction and every collector failure is treated as a generic channel error.
 func (a *App) SetControlPlaneError(err error) { a.controlPlaneErr = err }
+
+// SetFallbackActive installs a predicate reporting whether quota collection is
+// currently falling back to direct CPA queries because the OMC source failed.
+// While it reports true, nextPollWait keeps the regular interval so the fallback
+// cannot turn into a faster stream of direct upstream quota calls.
+func (a *App) SetFallbackActive(f func() bool) { a.fallbackActive = f }
 
 // SetNotifiers installs the outbound channels.
 func (a *App) SetNotifiers(n []domain.Notifier) {
@@ -203,7 +215,14 @@ func (a *App) RunPoll(ctx context.Context) error {
 // window is past its notice threshold: the stretch from "nearly out" to empty
 // can be shorter than one normal interval, and missing it means no alert
 // until after the account is already exhausted.
+//
+// During a direct-CPA fallback the regular interval is used regardless: the
+// fast poll exists to watch an upstream closely through OMC, and applying it
+// while reading CPA directly would just query the upstream more often.
 func (a *App) nextPollWait(rep domain.Report) time.Duration {
+	if a.fallbackActive != nil && a.fallbackActive() {
+		return a.cfg.PollInterval
+	}
 	fast := a.cfg.FastPollInterval
 	if fast <= 0 || fast >= a.cfg.PollInterval {
 		return a.cfg.PollInterval
@@ -580,7 +599,10 @@ func (a *App) collect(ctx context.Context) ([]domain.QuotaSnapshot, []collectFai
 // collector-wide failure can be attributed to provider reports. A collector
 // owning several providers (CPA) marks them all.
 var providersByCollector = map[string][]domain.ProviderKind{
-	"cpa":    {domain.ProviderCodex, domain.ProviderClaude, domain.ProviderAntigravity, domain.ProviderGeminiCLI},
+	"cpa": {domain.ProviderCodex, domain.ProviderClaude, domain.ProviderAntigravity, domain.ProviderGeminiCLI},
+	// The OMC source stands in for the CPA channel: same providers, same
+	// fallback target, so a collector-level failure is attributed identically.
+	"omc":    {domain.ProviderCodex, domain.ProviderClaude, domain.ProviderAntigravity, domain.ProviderGeminiCLI},
 	"ollama": {domain.ProviderOllama},
 }
 

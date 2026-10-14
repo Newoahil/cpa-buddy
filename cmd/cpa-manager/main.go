@@ -127,10 +127,17 @@ func run(log *slog.Logger) error {
 
 	store := state.NewFileStore(cfg.StatePath)
 	engine := evaluate.New(cfg, calendar.New(cfg.Location))
-	application := app.New(cfg, collect.AllWithCPA(cfg, cpaClient), engine, store, log)
+	collectors, fallback := collect.Build(cfg, cpaClient, log)
+	application := app.New(cfg, collectors, engine, store, log)
 	// Collector failures carry this sentinel when CPA itself is the problem, so
 	// app can report a control-plane outage instead of blaming credentials.
 	application.SetControlPlaneError(collect.ErrControlPlane)
+	if fallback != nil {
+		// While the OMC source is failing and we read CPA directly, keep the
+		// regular interval so the fallback does not accelerate upstream queries.
+		application.SetFallbackActive(fallback.InFallback)
+	}
+	log.Info("quota source configured", "source", cfg.QuotaSource, "omc_fallback_after", cfg.OMCFallbackAfter)
 	// The rate-limit cooldown watcher polls only the credential list, through
 	// the same client (and its shared list flight / backoff) as the collectors.
 	application.SetCooldownLister(cpaClient.ListCredentials)

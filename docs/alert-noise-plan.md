@@ -151,8 +151,17 @@ type PendingItem struct {
 
 ## 8. 依赖与顺序
 
-- 第 2.2 节里"OMC 中断"那一项依赖 `feat/omc-quota-source`（`FallbackCollector.InFallback`）。本分支先实现其他部分，把这一项做成接口预留，等两边都合入 main 后再接上。
+- `feat/omc-quota-source` 已合入 `origin/main`，依赖已满足。`internal/collect` 的 `FallbackCollector` 现在直接实现 policy 的 `OutageSource`：连续失败即视为 OMC 中断，`QUOTA_SOURCE=omc` 时由 `cmd/cpa-manager/main.go` 注入。中断（连续失败或处于回退）持续超过 `OMC_OUTAGE_PENDING_AFTER` 打开 `omc_outage` 待处理项（不即时推，只进汇总），恢复后关闭；中断开始时间持久化到 state（`omc_outage_since`），跨重启不重置。回退期间数据仍在更新，不会触发 `monitor_down`。
+- 监控停摆改成按渠道「最后一次拿到任何有效数据的时间」计时，计时点持久化在 state（`channel_tracks`），重启不重置。整个采集器失败（provider `Error`、零快照，例如 CPA 管理接口或 Ollama 整体不可达）以前不计时、不推送，现在计入；从未成功过的渠道从首次尝试时间开始计；渠道全部禁用或未配置不算。
 - 和 `internal/predict` 没有代码依赖。
+
+### 8.1 已接受的偏差
+
+实现与本文档之间有三处已确认的偏差，均按现状保留：
+
+1. `bootstrap_summary` 在免打扰期间照发。§2.4 说「所有即时推送都先攒着，不例外」，但启动确认是部署成功信号、一次性事件，实现中它与问题告警分开，免打扰也直接发出（见 `internal/app/app.go` 的 `splitBootstrap`）。
+2. 汇总卡片没有独立的「查询」按钮，复用现有的 CPA 链接按钮。交互式查询留给 CPA 页面或 agent，本期不新增按钮。
+3. 仅因凭据失效导致的渠道整体不可用不另推 `channel_unavailable`：这种情况已由每个账号的 `credential_invalid` 覆盖，`channel_unavailable` 只在存在非鉴权原因（账号级耗尽或冷却）时触发。
 
 ## 9. 不在本期范围
 

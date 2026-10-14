@@ -36,8 +36,8 @@ CPA 额度观察与通知 sidecar：状态页、Feishu 和可选 webhook，支�
 | `COOLDOWN_ALERT_AFTER` | `30m` | 只有 CPA 给出的恢复时间在该时长之后才推送（超出 CPA 自身最长 30 分钟退避，基本是额度用满）；CPA 日常的短冷却一律不推送，只计入日报 |
 | `ALERT_MODE` | `actionable` | `actionable` 只即时推送需要人动手的事（凭据失效、渠道整体不可用、监控停摆）；`legacy` 完整还原旧行为，仅作回退开关 |
 | `CHANNEL_UNAVAILABLE_AFTER` | `30m` | 渠道（全部已启用账号不可用）最早恢复时间晚于该时长才推；仅模型/分组级耗尽、全部禁用不算 |
-| `MONITOR_DOWN_AFTER` | `30m` | 渠道连续拿不到有效数据超过该时长才推一次（替代即时的 `suspect`/`stale`）；抖动不推 |
-| `OMC_OUTAGE_PENDING_AFTER` | `2h` | OMC 中断超过该时长才列入「待处理」，不即时推（依赖 `feat/omc-quota-source`，本分支仅预留接口） |
+| `MONITOR_DOWN_AFTER` | `30m` | 按渠道「最后一次拿到任何有效数据的时间」计时（持久化，重启不重置）；整个采集器失败也计入，超过该时长推一次（替代即时的 `suspect`/`stale`）；抖动不推 |
+| `OMC_OUTAGE_PENDING_AFTER` | `2h` | OMC 中断（连续失败或处于回退）超过该时长才列入「待处理」，不即时推；`QUOTA_SOURCE=omc` 时由 `FallbackCollector` 提供中断信号 |
 | `QUIET_HOURS` | `23:00-08:00` | 免打扰时段（可跨午夜，按 `TZ_NAME`）；期间即时推送先攒着，结束或恢复后合并发出；设空关闭 |
 | `SUMMARY_TIGHT_REMAINING` | `20` | 渠道紧张判定的剩余百分比，是定时汇总发送的条件之一 |
 | `QUOTA_HISTORY_DIR` | `<STATE_PATH 所在目录>/history` | 额度历史（append-only JSONL，按 `TZ_NAME` 的日界分文件），默认 `/data/history` |
@@ -181,7 +181,9 @@ v0/v8 来源分别记录为 `cpa-v0`/`cpa-v8`。
 - **回退**：`QUOTA_SOURCE=omc` 时每轮先试 OMC；连续失败达 `OMC_FALLBACK_AFTER` 后，
   该轮改为直接查 CPA 并记一条明确日志/状态；OMC 恢复后自动切回。回退期间抑制全局 3 分钟
   快速轮询，改用常规 `POLL_INTERVAL`，避免直接查上游变密。回退仍复用现有 `CPACollector`，
-  因此预警/通知规则、日报、history JSONL 格式都不变。
+  因此预警/通知规则、日报、history JSONL 格式都不变。连续失败（或处于回退）持续超过
+  `OMC_OUTAGE_PENDING_AFTER` 时打开 `omc_outage` 待处理项（只进汇总，不即时推），恢复后关闭；
+  中断开始时间持久化，跨重启不重置。
 
 OMC 接口属于另一条线的能力（`quota_list` 及其只读 key）；实际内网地址需按部署环境提供，
 本仓库不做发现。

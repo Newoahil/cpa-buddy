@@ -42,11 +42,10 @@ func ModeOf(raw string) Mode {
 
 // OutageSource reports an ongoing OMC fallback outage for a provider.
 //
-// This branch has no FallbackCollector (feat/omc-quota-source is not merged), so
-// the interface is reserved only: a nil OutageSource means an OMC outage is
-// never detected. When that feature lands, wire its InFallback signal here;
-// until then omc_outage never reaches a card. The comment is deliberate so the
-// gap is not mistaken for dead code.
+// collect.FallbackCollector implements it: a run of consecutive OMC failures is
+// an interruption, and it speaks only for the CPA-owned providers. A nil
+// OutageSource (QUOTA_SOURCE=cpa) means an OMC outage is never detected, so
+// omc_outage never reaches a card.
 type OutageSource interface {
 	// OutageSince returns the start of an ongoing OMC fallback outage for
 	// provider and whether one is active at now.
@@ -68,7 +67,11 @@ type Input struct {
 	Report domain.Report
 	Alerts []domain.Alert
 	Prev   []state.PendingItem
-	Now    time.Time
+	// ChannelTracks is the persisted per-provider last-valid-data memory that
+	// backs monitor_down. Empty on a cold start; the snapshots then supply the
+	// only available reference.
+	ChannelTracks map[domain.ProviderKind]state.ChannelTrack
+	Now           time.Time
 	// Quiet marks that immediate pushes are held back. The classification is
 	// the same, but a newly opened item is left un-notified so the quiet-end
 	// merge (or the next non-quiet cycle) sends it.
@@ -99,7 +102,7 @@ func Evaluate(cfg Config, in Input) Result {
 	}
 
 	now := in.Now
-	info := analyze(cfg, in.Report, now)
+	info := analyze(cfg, in.Report, now, in.ChannelTracks)
 
 	// prevAll keys the previous items; resolved items are kept so a recurrence
 	// can reopen them (and re-alert once).
@@ -267,7 +270,9 @@ func signals(cfg Config, in Input, info reportInfo) (desired map[string]state.Pe
 		alertFor[id] = &a
 	}
 
-	// omc_outage: reserved. Never immediate; pending only.
+	// omc_outage: an OMC fallback outage lasting past the threshold. It never
+	// pushes immediately; it is a pending item for the summary, and it closes
+	// when the source recovers.
 	if cfg.Outage != nil {
 		for _, p := range info.providers {
 			since, active := cfg.Outage.OutageSince(p.provider, now)

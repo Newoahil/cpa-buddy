@@ -146,13 +146,106 @@ func New(cfg config.Config, collectors []domain.Collector, engine *evaluate.Engi
 	}
 }
 
-// SetOutageSource installs the reserved OMC fallback signal. Without it
-// (the current state of this branch) omc_outage items are never produced.
+// SetOutageSource installs the OMC fallback outage signal (a
+// *collect.FallbackCollector). A nil source leaves omc_outage dormant. When the
+// source also implements outageTracker the app persists the outage start so the
+// pending threshold survives a restart.
 func (a *App) SetOutageSource(src policy.OutageSource) {
 	a.outageMu.Lock()
 	a.outage = src
 	a.policy.Outage = src
 	a.outageMu.Unlock()
+}
+
+// outageTracker is the persistence half of the OMC outage signal: the concrete
+// collector exposes the current outage start and can be seeded from state. A
+// source that does not implement it is still usable, just not restart-durable.
+type outageTracker interface {
+	OutageStart() time.Time
+	RestoreOutage(time.Time)
+}
+
+func (a *App) outageSource() policy.OutageSource {
+	a.outageMu.RLock()
+	defer a.outageMu.RUnlock()
+	return a.outage
+}
+
+// reconcileOMCOutage merges the live collector outage with the persisted start
+// so the OMC_OUTAGE_PENDING_AFTER clock is measured from the true beginning
+// across a restart. It returns the instant to persist, or the zero time when no
+// outage is active.
+func (a *App) reconcileOMCOutage(prev *state.State, rep domain.Report, now time.Time) time.Time {
+	src := a.outageSource()
+	if src == nil {
+		return time.Time{}
+	}
+	var (
+		liveStart time.Time
+		active    bool
+		seen      = map[domain.ProviderKind]bool{}
+	)
+	for _, p := range rep.Providers {
+		if seen[p.Provider] {
+			continue
+		}
+		seen[p.Provider] = true
+		s, isActive := src.OutageSince(p.Provider, now)
+		if !isActive {
+			continue
+		}
+		active = true
+		if liveStart.IsZero() || s.Before(liveStart) {
+			liveStart = s
+		}
+	}
+	if !active {
+		return time.Time{}
+	}
+	if prev != nil && !prev.OMCOutageSince.IsZero() && prev.OMCOutageSince.Before(liveStart) {
+		// The outage predates this process: bridge back to its real start.
+		liveStart = prev.OMCOutageSince
+	}
+	if tr, ok := src.(outageTracker); ok {
+		tr.RestoreOutage(liveStart)
+	}
+	return liveStart
+}
+
+// updateChannelTracks advances the per-provider last-valid-data memory for
+// monitor_down. A channel's FirstSeen is stamped the first time it appears; its
+// LastValid only moves when it actually produced a valid reading. Providers
+// missing from the report are left untouched.
+func updateChannelTracks(prev map[domain.ProviderKind]state.ChannelTrack, rep domain.Report, now time.Time) map[domain.ProviderKind]state.ChannelTrack {
+	out := make(map[domain.ProviderKind]state.ChannelTrack, len(prev)+len(rep.Providers))
+	for k, v := range prev {
+		out[k] = v
+	}
+	for _, p := range rep.Providers {
+		t := out[p.Provider]
+		if t.FirstSeen.IsZero() {
+			t.FirstSeen = now
+		}
+		if reportProviderHasValid(p) {
+			t.LastValid = now
+		}
+		out[p.Provider] = t
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// reportProviderHasValid reports whether any enabled account produced a valid
+// reading in this provider's report.
+func reportProviderHasValid(p domain.ProviderReport) bool {
+	for _, s := range p.Snapshots {
+		if !s.Credential.Disabled && s.OK {
+			return true
+		}
+	}
+	return false
 }
 
 // actionable reports whether the new push policy is active.
@@ -587,20 +680,28 @@ func (a *App) runCycle(ctx context.Context) (domain.Report, bool) {
 	a.decorateReport(&report, prev, failures)
 	a.setLast(report)
 
+	// Advance the monitor_down memory and reconcile the OMC outage window (so
+	// the policy sees a start that survives this restart) before classifying.
+	tracks := updateChannelTracks(prev.ChannelTracks, report, now)
+	outageSince := a.reconcileOMCOutage(prev, report, now)
+
 	// Classify: what to push, what to open/close as a pending item, what to
 	// drop. In legacy mode this is a pass-through and nothing else changes.
 	quiet := a.inQuiet(now)
 	outcome := policy.Evaluate(a.policy, policy.Input{
-		Report: report,
-		Alerts: alerts,
-		Prev:   prev.PendingItems,
-		Now:    now,
-		Quiet:  quiet,
+		Report:        report,
+		Alerts:        alerts,
+		Prev:          prev.PendingItems,
+		ChannelTracks: tracks,
+		Now:           now,
+		Quiet:         quiet,
 	})
 
 	var quietDigest, bootstrapNow []domain.Alert
 	if next != nil {
 		next.PendingItems = outcome.Items
+		next.ChannelTracks = tracks
+		next.OMCOutageSince = outageSince
 		// Resolved items are kept briefly then dropped, so the file cannot grow
 		// without bound.
 		next.PruneResolved(now)

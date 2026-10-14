@@ -378,6 +378,46 @@ func TestOldStateFileLoadsWithoutNewFields(t *testing.T) {
 	if st.PendingItems != nil || st.QuietQueue != nil {
 		t.Errorf("new fields should default to nil, got %+v / %+v", st.PendingItems, st.QuietQueue)
 	}
+	if st.ChannelTracks != nil {
+		t.Errorf("channel tracks should default to nil, got %+v", st.ChannelTracks)
+	}
+	if !st.OMCOutageSince.IsZero() {
+		t.Errorf("OMCOutageSince should default to zero, got %v", st.OMCOutageSince)
+	}
+}
+
+// TestChannelTrackingRoundTrip covers the monitor_down / omc_outage memory.
+func TestChannelTrackingRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	store := NewFileStore(path)
+	firstSeen := time.Date(2026, 10, 10, 8, 0, 0, 0, time.UTC)
+	lastValid := time.Date(2026, 10, 14, 11, 0, 0, 0, time.UTC)
+	outage := time.Date(2026, 10, 14, 9, 0, 0, 0, time.UTC)
+
+	st := Empty()
+	st.Bootstrapped = true
+	st.ChannelTracks = map[domain.ProviderKind]ChannelTrack{
+		domain.ProviderCodex:  {FirstSeen: firstSeen, LastValid: lastValid},
+		domain.ProviderOllama: {FirstSeen: firstSeen},
+	}
+	st.OMCOutageSince = outage
+	if err := store.Save(st); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.OMCOutageSince.Equal(outage) {
+		t.Fatalf("OMCOutageSince = %v, want %v", got.OMCOutageSince, outage)
+	}
+	track, ok := got.ChannelTracks[domain.ProviderCodex]
+	if !ok || !track.FirstSeen.Equal(firstSeen) || !track.LastValid.Equal(lastValid) {
+		t.Fatalf("codex track = %+v", track)
+	}
+	if oll := got.ChannelTracks[domain.ProviderOllama]; !oll.LastValid.IsZero() {
+		t.Fatalf("never-valid track must keep LastValid zero: %+v", oll)
+	}
 }
 
 func TestProjectPriority(t *testing.T) {

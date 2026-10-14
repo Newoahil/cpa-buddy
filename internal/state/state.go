@@ -179,6 +179,20 @@ const (
 // that a problem was fixed, without growing the file forever.
 const resolvedPendingRetention = 7 * 24 * time.Hour
 
+// ChannelTrack is the per-provider memory behind monitor_down: when the channel
+// was first observed and when it last produced any valid data. Persisting it
+// lets an outage be timed from its real beginning across restarts, including a
+// collector-level failure that yields no snapshots at all (docs/alert-noise-plan
+// §2.1).
+type ChannelTrack struct {
+	// FirstSeen is the first time this channel appeared in a report, even if it
+	// never succeeded. A channel that has never produced valid data is timed
+	// from here, so an upstream that is born broken still eventually alerts.
+	FirstSeen time.Time `json:"first_seen,omitempty"`
+	// LastValid is the last time any enabled account produced a valid reading.
+	LastValid time.Time `json:"last_valid,omitempty"`
+}
+
 // PendingItem is one structured "something needs a human" record
 // (docs/alert-noise-plan.md §4). It is deliberately secret-free: it carries the
 // opaque credential key and the display alias, never a cookie or token.
@@ -215,6 +229,13 @@ type State struct {
 	// QuietQueue holds immediate alerts accumulated while quiet hours are
 	// active, so a restart does not lose them.
 	QuietQueue []domain.Alert `json:"quiet_queue,omitempty"`
+	// ChannelTracks backs monitor_down: the last-valid-data time per provider.
+	// Absent in old files, which load as nil.
+	ChannelTracks map[domain.ProviderKind]ChannelTrack `json:"channel_tracks,omitempty"`
+	// OMCOutageSince is when the current OMC fallback outage began. It is
+	// persisted so a restart neither restarts the OMC_OUTAGE_PENDING_AFTER
+	// clock nor double-lists the pending item. Zero means no outage is active.
+	OMCOutageSince time.Time `json:"omc_outage_since,omitempty"`
 }
 
 // PendingItem returns the item with id and whether it was found.

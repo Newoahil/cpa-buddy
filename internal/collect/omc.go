@@ -289,8 +289,18 @@ type FallbackCollector struct {
 	threshold int
 	log       *slog.Logger
 
-	mu       sync.Mutex
+	mu sync.Mutex
+	// failures is the run of consecutive primary failures. It resets on any
+	// successful primary read.
 	failures int
+	// outageStart is when the current failure run began, i.e. the first failure
+	// of the run. It is zero when no outage is ongoing.
+	outageStart time.Time
+	// providers are the providers this primary speaks for. An OMC outage only
+	// concerns them; other collectors' providers must never report one.
+	providers map[domain.ProviderKind]bool
+
+	now func() time.Time
 }
 
 // NewFallbackCollector builds the wrapper. A threshold below 1 is treated as 1,
@@ -302,12 +312,66 @@ func NewFallbackCollector(primary, fallback domain.Collector, threshold int, log
 	if threshold < 1 {
 		threshold = 1
 	}
-	return &FallbackCollector{primary: primary, fallback: fallback, threshold: threshold, log: log}
+	return &FallbackCollector{primary: primary, fallback: fallback, threshold: threshold, log: log, now: time.Now}
 }
 
 // Name implements domain.Collector: the primary's name, so provider
 // attribution stays the same whether or not the fallback is active.
 func (f *FallbackCollector) Name() string { return f.primary.Name() }
+
+// SetOutageProviders declares the providers this source speaks for, so an OMC
+// outage is attributed only to those channels and never to Ollama or another
+// independent collector.
+func (f *FallbackCollector) SetOutageProviders(providers ...domain.ProviderKind) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.providers == nil {
+		f.providers = map[domain.ProviderKind]bool{}
+	}
+	for _, p := range providers {
+		f.providers[p] = true
+	}
+}
+
+// OutageSince reports the start of an ongoing OMC outage for provider and
+// whether one is active. It implements the policy's OutageSource: a run of
+// consecutive failures (whether or not it has crossed the fallback threshold)
+// is an interruption, and a provider this source does not speak for is never
+// outaged.
+func (f *FallbackCollector) OutageSince(provider domain.ProviderKind, _ time.Time) (time.Time, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.failures <= 0 || !f.providers[provider] {
+		return time.Time{}, false
+	}
+	return f.outageStart, true
+}
+
+// OutageStart returns the start of the current outage, or the zero time when
+// none is ongoing. The app persists it so the clock survives a restart.
+func (f *FallbackCollector) OutageStart() time.Time {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.failures <= 0 {
+		return time.Time{}
+	}
+	return f.outageStart
+}
+
+// RestoreOutage seeds the outage start from persisted state. It only ever moves
+// the start earlier, so a live run that began after a restart is bridged back to
+// the original outage instead of restarting the clock. It is a no-op when no
+// outage is active.
+func (f *FallbackCollector) RestoreOutage(start time.Time) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.failures <= 0 || start.IsZero() {
+		return
+	}
+	if f.outageStart.IsZero() || start.Before(f.outageStart) {
+		f.outageStart = start
+	}
+}
 
 // InFallback reports whether the last attempt reached the failure threshold.
 // The app uses it to keep the fast poll from accelerating direct CPA queries.
@@ -344,35 +408,49 @@ func (f *FallbackCollector) Collect(ctx context.Context) ([]domain.QuotaSnapshot
 }
 
 // recordFailure increments the counter and reports whether the threshold is met.
+// The first failure of a run stamps the outage start.
 func (f *FallbackCollector) recordFailure() (int, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.failures == 0 {
+		f.outageStart = f.now()
+	}
 	f.failures++
 	return f.failures, f.failures >= f.threshold
 }
 
-// reset clears the counter and reports whether the previous state was fallback
-// (so "recovered" is logged exactly once, on the transition).
+// reset clears the counter and the outage start, and reports whether the
+// previous state was fallback (so "recovered" is logged exactly once, on the
+// transition).
 func (f *FallbackCollector) reset() bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	was := f.failures >= f.threshold
 	f.failures = 0
+	f.outageStart = time.Time{}
 	return was
+}
+
+// cpaProviders are the channels the CPA/OMC source speaks for. They share one
+// primary collector, so an OMC outage is attributed to all of them and never to
+// an unrelated collector such as Ollama.
+var cpaProviders = []domain.ProviderKind{
+	domain.ProviderCodex, domain.ProviderClaude, domain.ProviderAntigravity, domain.ProviderGeminiCLI,
 }
 
 // Build assembles the collectors for the configured quota source.
 //
 // When QUOTA_SOURCE=omc it returns a single OMC-backed collector wrapped in a
 // fallback to the direct CPA collector, plus that wrapper so the composition
-// root can install its InFallback predicate on the app. Otherwise it returns
-// the unchanged direct CPA collector and a nil fallback.
+// root can install its InFallback predicate and OMC outage source on the app.
+// Otherwise it returns the unchanged direct CPA collector and a nil fallback.
 func Build(cfg config.Config, client *cpa.Client, log *slog.Logger) ([]domain.Collector, *FallbackCollector) {
 	var fallback *FallbackCollector
 	out := make([]domain.Collector, 0, 2)
 	if cfg.QuotaSource == config.QuotaSourceOMC {
 		primary := NewOMCCollector(client, omc.New(cfg.OMCMCPURL, cfg.OMCMCPKey, cfg.CPATimeout))
 		fallback = NewFallbackCollector(primary, NewCPACollector(client), cfg.OMCFallbackAfter, log)
+		fallback.SetOutageProviders(cpaProviders...)
 		out = append(out, fallback)
 	} else {
 		out = append(out, NewCPACollector(client))

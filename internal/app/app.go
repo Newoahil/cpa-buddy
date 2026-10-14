@@ -19,6 +19,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -27,6 +29,7 @@ import (
 	"github.com/Newoahil/CPA-Manager/internal/domain"
 	"github.com/Newoahil/CPA-Manager/internal/evaluate"
 	"github.com/Newoahil/CPA-Manager/internal/history"
+	"github.com/Newoahil/CPA-Manager/internal/notify/policy"
 	"github.com/Newoahil/CPA-Manager/internal/state"
 )
 
@@ -81,6 +84,15 @@ type App struct {
 	// quota queries during a fallback.
 	fallbackActive func() bool
 
+	// policy is the push classification (internal/notify/policy). In legacy
+	// mode it is a pass-through and the app behaves exactly as before.
+	policy policy.Config
+
+	// outage is the OMC fallback source, installed by SetOutageSource once a
+	// FallbackCollector exists. Nil leaves omc_outage dormant.
+	outageMu sync.RWMutex
+	outage   policy.OutageSource
+
 	now func() time.Time
 }
 
@@ -106,14 +118,57 @@ func New(cfg config.Config, collectors []domain.Collector, engine *evaluate.Engi
 	if log == nil {
 		log = slog.Default()
 	}
+	pol := policy.Config{
+		Mode:                    policy.ModeOf(cfg.AlertMode),
+		ChannelUnavailableAfter: cfg.ChannelUnavailableAfter,
+		MonitorDownAfter:        cfg.MonitorDownAfter,
+		OMCOutagePendingAfter:   cfg.OMCOutagePendingAfter,
+		Location:                cfg.Location,
+	}
+	// A directly-constructed config (tests, embedders) may leave these zero.
+	if pol.ChannelUnavailableAfter <= 0 {
+		pol.ChannelUnavailableAfter = config.DefaultChannelUnavailableAfter
+	}
+	if pol.MonitorDownAfter <= 0 {
+		pol.MonitorDownAfter = config.DefaultMonitorDownAfter
+	}
+	if pol.OMCOutagePendingAfter <= 0 {
+		pol.OMCOutagePendingAfter = config.DefaultOMCOutagePendingAfter
+	}
 	return &App{
 		cfg:        cfg,
 		collectors: collectors,
 		engine:     engine,
 		store:      store,
 		log:        log,
+		policy:     pol,
 		now:        time.Now,
 	}
+}
+
+// SetOutageSource installs the reserved OMC fallback signal. Without it
+// (the current state of this branch) omc_outage items are never produced.
+func (a *App) SetOutageSource(src policy.OutageSource) {
+	a.outageMu.Lock()
+	a.outage = src
+	a.policy.Outage = src
+	a.outageMu.Unlock()
+}
+
+// actionable reports whether the new push policy is active.
+func (a *App) actionable() bool { return a.policy.Mode == policy.Actionable }
+
+// inQuiet reports whether immediate pushes are currently held back. Legacy mode
+// never holds anything back, so a rollback is behaviour-identical.
+func (a *App) inQuiet(now time.Time) bool {
+	if !a.actionable() {
+		return false
+	}
+	loc := a.cfg.Location
+	if loc == nil {
+		loc = time.Local
+	}
+	return a.cfg.QuietHours.Contains(now.In(loc))
 }
 
 // SetHistory installs the quota-history writer. Without it, successful cycles
@@ -192,8 +247,11 @@ func (a *App) RunPoll(ctx context.Context) error {
 	defer cooldownDone.Wait()
 
 	// Deliver anything the previous process left queued before touching
-	// upstreams, so a restart does not delay a pending alert.
-	a.FlushPending(ctx)
+	// upstreams, so a restart does not delay a pending alert. During quiet
+	// hours this is held back instead.
+	if !a.inQuiet(a.now()) {
+		a.FlushPending(ctx)
+	}
 	// Run once immediately so the status page and the first summary are not
 	// empty for a whole interval.
 	report, _ := a.runCycle(ctx)
@@ -220,7 +278,16 @@ func (a *App) RunPoll(ctx context.Context) error {
 // fast poll exists to watch an upstream closely through OMC, and applying it
 // while reading CPA directly would just query the upstream more often.
 func (a *App) nextPollWait(rep domain.Report) time.Duration {
+	// A direct-CPA fallback keeps the regular interval: the fast poll exists to
+	// watch an upstream closely through OMC, and applying it while reading CPA
+	// directly would just query the upstream more often.
 	if a.fallbackActive != nil && a.fallbackActive() {
+		return a.cfg.PollInterval
+	}
+	// Actionable mode drops the "past 90% -> 3-minute poll" rule: nothing is
+	// pushed at that threshold any more, so a faster poll would only add
+	// upstream load. The fast interval is still honoured in legacy mode.
+	if a.actionable() {
 		return a.cfg.PollInterval
 	}
 	fast := a.cfg.FastPollInterval
@@ -287,6 +354,16 @@ func (a *App) enqueueAlerts(ctx context.Context, alerts []domain.Alert) {
 	if len(a.notifierSnapshot()) == 0 {
 		return
 	}
+	// Actionable mode drops the cooldown watcher's rate_limited /
+	// rate_limit_cleared events (§2.2): only a credential or a channel outage
+	// is worth a push. Legacy mode keeps them.
+	if a.actionable() {
+		out := policy.Evaluate(a.policy, policy.Input{Alerts: alerts, Now: a.now()})
+		alerts = out.Immediate
+		if len(alerts) == 0 {
+			return
+		}
+	}
 	if a.queueAlerts(alerts) {
 		a.FlushPending(ctx)
 		return
@@ -337,6 +414,10 @@ func (a *App) SendSummary(ctx context.Context) {
 		last.Notes = appendNote(last.Notes, "本轮采集未完成，以下为上一轮结果")
 		report = last
 	}
+	if a.actionable() {
+		a.sendActionableSummary(ctx, report)
+		return
+	}
 	// Short rate-limit cooldowns since the previous digest ride along on this
 	// copy of the report (never on the cached one) and are then reset. A digest
 	// that fails to send is not retried, so neither are its tallies.
@@ -348,6 +429,102 @@ func (a *App) SendSummary(ctx context.Context) {
 		Kind:   string(domain.AlertBootstrap),
 		Report: &report,
 	})
+}
+
+// sendActionableSummary applies §3.1: send only when something needs attention
+// (an open pending item or a tight channel), and never during quiet hours.
+func (a *App) sendActionableSummary(ctx context.Context, report domain.Report) {
+	if a.inQuiet(a.now()) {
+		a.log.Info("summary skipped: quiet hours")
+		return
+	}
+	var items []state.PendingItem
+	if st, err := a.store.Load(); err == nil && st != nil {
+		items = st.PendingItems
+	}
+	var open []state.PendingItem
+	for _, it := range items {
+		if it.Status == state.PendingOpen {
+			open = append(open, it)
+		}
+	}
+	tight := policy.TightChannels(report, a.cfg.SummaryTightRemaining)
+	if len(open) == 0 && len(tight) == 0 {
+		a.log.Info("summary skipped: nothing to report")
+		return
+	}
+
+	card := &domain.ActionableCard{
+		HeaderColor: summaryColor(open, tight),
+		Conclusion:  summaryConclusion(open, tight),
+		Tight:       tight,
+	}
+	for _, it := range open {
+		card.Pending = append(card.Pending, domain.PendingRow{
+			Kind:     domain.AlertKind(it.Kind),
+			Provider: it.Provider,
+			Alias:    it.Alias,
+			Since:    it.Since,
+			Action:   it.Action,
+		})
+	}
+	a.dispatch(ctx, domain.Message{
+		Title:      "额度汇总",
+		Kind:       string(domain.AlertActionableSummary),
+		Report:     &report,
+		Actionable: card,
+	})
+}
+
+// summaryColor is the header template: the worst pending item, else the tight
+// channel's warning colour.
+func summaryColor(pending []state.PendingItem, tight []domain.TightChannel) string {
+	if len(pending) > 0 {
+		for _, it := range pending {
+			switch domain.AlertKind(it.Kind) {
+			case domain.AlertCredential, domain.AlertChannelUnavailable:
+				return "red"
+			}
+		}
+		return "orange"
+	}
+	if len(tight) > 0 {
+		return "orange"
+	}
+	return "blue"
+}
+
+// summaryConclusion is the one-line verdict, e.g. "Claude 紧张，有 1 项待处理".
+func summaryConclusion(pending []state.PendingItem, tight []domain.TightChannel) string {
+	var clauses []string
+	if len(tight) > 0 {
+		names := make([]string, 0, len(tight))
+		for _, t := range tight {
+			names = append(names, providerDisplay(t.Provider))
+		}
+		clauses = append(clauses, strings.Join(names, "、")+" 紧张")
+	}
+	if len(pending) > 0 {
+		clauses = append(clauses, "有 "+strconv.Itoa(len(pending))+" 项待处理")
+	}
+	return strings.Join(clauses, "，")
+}
+
+func providerDisplay(p domain.ProviderKind) string {
+	switch p {
+	case domain.ProviderCodex:
+		return "Codex"
+	case domain.ProviderClaude:
+		return "Claude"
+	case domain.ProviderAntigravity:
+		return "Antigravity"
+	case domain.ProviderGeminiCLI:
+		return "Gemini CLI"
+	case domain.ProviderOllama:
+		return "Ollama"
+	default:
+		return string(p)
+	}
 }
 
 // runCycle is the authoritative path: collect, evaluate, persist, queue, notify.
@@ -410,10 +587,38 @@ func (a *App) runCycle(ctx context.Context) (domain.Report, bool) {
 	a.decorateReport(&report, prev, failures)
 	a.setLast(report)
 
+	// Classify: what to push, what to open/close as a pending item, what to
+	// drop. In legacy mode this is a pass-through and nothing else changes.
+	quiet := a.inQuiet(now)
+	outcome := policy.Evaluate(a.policy, policy.Input{
+		Report: report,
+		Alerts: alerts,
+		Prev:   prev.PendingItems,
+		Now:    now,
+		Quiet:  quiet,
+	})
+
+	var quietDigest, bootstrapNow []domain.Alert
 	if next != nil {
+		next.PendingItems = outcome.Items
+		// Resolved items are kept briefly then dropped, so the file cannot grow
+		// without bound.
+		next.PruneResolved(now)
+		next.QuietQueue = cloneAlerts(prev.QuietQueue)
+		var hold []domain.Alert
+		bootstrapNow, hold = splitBootstrap(outcome.Immediate)
 		a.outboxMu.Lock()
-		if len(alerts) > 0 {
-			next.QueuePending(a.channelNames(), alerts)
+		if quiet {
+			// Hold the noise back; the queue is persisted so a restart keeps it.
+			next.QueueQuiet(hold)
+		} else {
+			if len(outcome.Immediate) > 0 {
+				next.QueuePending(a.channelNames(), outcome.Immediate)
+			}
+			// A quiet window that just ended sends the still-unresolved events
+			// it held back, in one merged message.
+			quietDigest = stillOpen(next.QuietQueue, outcome.Items)
+			next.QuietQueue = nil
 		}
 		if err := a.store.Save(next); err != nil {
 			// Losing the save means the next cycle may re-alert. Noisy but safe.
@@ -423,19 +628,92 @@ func (a *App) runCycle(ctx context.Context) (domain.Report, bool) {
 	}
 	a.persistMu.Unlock()
 
+	// The startup bootstrap confirms the deployment succeeded. It is not noise
+	// and fires once, so it is delivered even inside quiet hours.
+	if quiet && len(bootstrapNow) > 0 {
+		a.dispatch(ctx, buildAlertMessage(&report, bootstrapNow))
+	}
+
 	if runner {
 		a.finishRun(r, snaps, failures, report, true, nil)
 	}
 
 	a.log.Info("cycle complete",
 		"snapshots", len(snaps),
-		"alerts", len(alerts),
+		"alerts", len(outcome.Immediate),
+		"quiet", quiet,
 		"duration_ms", a.now().Sub(started).Milliseconds(),
 	)
 
+	if len(quietDigest) > 0 {
+		// If every accumulated event recovered on its own, nothing is sent.
+		a.dispatch(ctx, domain.Message{
+			Title:  "免打扰结束",
+			Kind:   string(domain.AlertQuietDigest),
+			Alerts: quietDigest,
+			Report: &report,
+		})
+	}
+
 	// Notification happens outside every lock. Failures leave the alerts queued.
-	a.FlushPending(ctx)
+	// During quiet hours the outbox is deliberately left untouched.
+	if !quiet {
+		a.FlushPending(ctx)
+	}
 	return report, true
+}
+
+// splitBootstrap separates the one-off deployment confirmation from the
+// problem alerts. Only the latter are held back by quiet hours.
+func splitBootstrap(alerts []domain.Alert) (bootstrap, rest []domain.Alert) {
+	for _, a := range alerts {
+		if a.Kind == domain.AlertBootstrap {
+			bootstrap = append(bootstrap, a)
+		} else {
+			rest = append(rest, a)
+		}
+	}
+	return bootstrap, rest
+}
+
+// cloneAlerts is a defensive copy of a slice of alerts.
+func cloneAlerts(in []domain.Alert) []domain.Alert {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]domain.Alert, len(in))
+	copy(out, in)
+	return out
+}
+
+// stillOpen filters the quiet-hours queue to the alerts whose pending item is
+// still open. An event that resolved on its own is dropped, which is what makes
+// "everything recovered -> send nothing" work.
+func stillOpen(queued []domain.Alert, items []state.PendingItem) []domain.Alert {
+	open := map[string]bool{}
+	for _, it := range items {
+		if it.Status == state.PendingOpen {
+			open[it.ID] = true
+		}
+	}
+	var out []domain.Alert
+	seen := map[string]bool{}
+	for _, a := range queued {
+		id := policy.AlertItemID(a)
+		if id != "" && !open[id] {
+			continue
+		}
+		key := id
+		if key == "" {
+			key = string(a.Kind) + "|" + string(a.Credential.Provider) + "|" + a.Credential.Key
+		}
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, a)
+	}
+	return out
 }
 
 // recordHistory appends one line per credential per quota window for a

@@ -76,17 +76,21 @@ func (r *Renderer) WithIgnoredGroups(groups []string) *Renderer {
 
 // Default titles. They are intentionally usable as-is; env vars only override.
 var defaultTitles = map[string]string{
-	string(domain.AlertQuotaThreshold):   "额度提醒",
-	string(domain.AlertQuotaExhausted):   "额度告急",
-	string(domain.AlertCredential):       "凭证失效",
-	string(domain.AlertSuspect):          "异常疑似",
-	string(domain.AlertStale):            "数据过期",
-	string(domain.AlertRecovered):        "额度恢复",
-	string(domain.AlertQuotaReset):       "额度刷新",
-	string(domain.AlertBootstrap):        "额度日报",
-	string(domain.AlertRateLimited):      "限流告警",
-	string(domain.AlertRateLimitCleared): "额度恢复",
-	KindQuery:                            "额度查询",
+	string(domain.AlertQuotaThreshold):     "额度提醒",
+	string(domain.AlertQuotaExhausted):     "额度告急",
+	string(domain.AlertCredential):         "凭证失效",
+	string(domain.AlertSuspect):            "异常疑似",
+	string(domain.AlertStale):              "数据过期",
+	string(domain.AlertRecovered):          "额度恢复",
+	string(domain.AlertQuotaReset):         "额度刷新",
+	string(domain.AlertBootstrap):          "额度日报",
+	string(domain.AlertRateLimited):        "限流告警",
+	string(domain.AlertRateLimitCleared):   "额度恢复",
+	string(domain.AlertChannelUnavailable): "渠道不可用",
+	string(domain.AlertMonitorDown):        "监控停摆",
+	string(domain.AlertQuietDigest):        "免打扰结束",
+	string(domain.AlertActionableSummary):  "额度汇总",
+	KindQuery:                              "额度查询",
 }
 
 // New builds a renderer for the given tone (config.ToneCasual or

@@ -681,6 +681,9 @@ func alertKindPhrase(a domain.Alert) (color, phrase string) {
 	case domain.AlertRateLimitCleared:
 		return "green", "已恢复可用"
 	default:
+		if c, p, ok := actionableAlertPhrase(a.Kind); ok {
+			return c, p
+		}
 		if a.Title != "" {
 			return "neutral", a.Title
 		}

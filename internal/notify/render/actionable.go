@@ -58,20 +58,20 @@ func (r *Renderer) actionableText(card *domain.ActionableCard) string {
 // actionableSummaryElements renders actionable cards:
 //
 // 1. Immediate alerts (channel_unavailable, credential_invalid, monitor_down):
-//    - Advice first: tell the user what to do immediately
-//    - Timing: start time, duration, and expected recovery
-//    - Account detail panel & CPA buttons
+//   - Advice first: tell the user what to do immediately
+//   - Timing: start time, duration, and expected recovery
+//   - Account detail panel & CPA buttons
 //
 // 2. Quiet hours merge digest (quiet_digest):
-//    - Merged verdict: night-time summary
-//    - Pending items list (reusing pendingRow)
-//    - Tight channels (if any)
+//   - Merged verdict: night-time summary
+//   - Pending items list (reusing pendingRow)
+//   - Tight channels (if any)
 //
 // 3. Scheduled digest (actionable_summary):
-//    - One-line conclusion
-//    - Pending items (only if present): [Tag] Provider Account · Duration \n Advice
-//    - Tight channels: Provider · Best Account Remaining % · Reset time (Absolute + Relative)
-//    - Account detail panel & CPA buttons
+//   - One-line conclusion
+//   - Pending items (only if present): [Tag] Provider Account · Duration \n Advice
+//   - Tight channels: Provider · Best Account Remaining % · Reset time (Absolute + Relative)
+//   - Account detail panel & CPA buttons
 func (r *Renderer) actionableSummaryElements(msg domain.Message, full bool) []any {
 	card := msg.Actionable
 	base := r.messageBaseTime(msg)

@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -62,6 +63,21 @@ type Config struct {
 	// Ollama Cloud accounts, scraped from the settings page.
 	OllamaAccounts []OllamaAccount
 	OllamaTimeout  time.Duration
+
+	// Quota source. When QuotaSource is QuotaSourceOMC, CPA quota is read from
+	// Oh My CPA's read-only Streamable HTTP MCP endpoint instead of querying
+	// CPA's upstream quota directly, so OMC stays the only party actively
+	// querying upstreams. The CPA credential list is still read (management
+	// API, not an upstream quota query) for identity and aliases.
+	QuotaSource string
+	// OMCMCPURL is the OMC MCP endpoint, e.g. http://omc:8080/omc/api/mcp.
+	OMCMCPURL string
+	// OMCMCPKey is the read-only MCP bearer key. It is a secret: never logged,
+	// never rendered, never persisted.
+	OMCMCPKey string
+	// OMCFallbackAfter is the number of consecutive OMC failures after which
+	// quota collection falls back to querying CPA directly for a cycle.
+	OMCFallbackAfter int
 
 	// Polling and evaluation.
 	PollInterval time.Duration
@@ -144,6 +160,14 @@ const (
 	DefaultCooldownAlertAfter = 30 * time.Minute
 	// DefaultQuotaIgnoredGroups is the default comma-separated model groups to ignore in notifications.
 	DefaultQuotaIgnoredGroups = "Claude and GPT models"
+	// QuotaSourceCPA (the default) queries CPA's management API directly;
+	// QuotaSourceOMC reads the quota OMC has collected instead. The OMC_MCP_*
+	// settings are only required when QUOTA_SOURCE=omc.
+	QuotaSourceCPA = "cpa"
+	QuotaSourceOMC = "omc"
+	// DefaultOMCFallbackAfter is how many consecutive OMC failures trigger a
+	// direct CPA fallback: one hiccup is not enough to bypass OMC.
+	DefaultOMCFallbackAfter = 3
 )
 
 // Load reads configuration from the process environment and validates it.
@@ -187,6 +211,10 @@ func Load() (Config, error) {
 	cfg.CooldownAlertAfter = mustDuration(&errs, "COOLDOWN_ALERT_AFTER", DefaultCooldownAlertAfter)
 	cfg.FeishuEnabled = mustBool(&errs, "FEISHU_ENABLED", false)
 	cfg.CardChartsEnabled = mustBool(&errs, "CARD_CHARTS_ENABLED", false)
+	cfg.QuotaSource = env("QUOTA_SOURCE", QuotaSourceCPA)
+	cfg.OMCMCPURL = env("OMC_MCP_URL", "")
+	cfg.OMCMCPKey = env("OMC_MCP_KEY", "")
+	cfg.OMCFallbackAfter = mustInt(&errs, "OMC_FALLBACK_AFTER", DefaultOMCFallbackAfter)
 
 	cfg.DefaultThresholds = Thresholds{
 		Notice: mustFloat(&errs, "QUOTA_THRESHOLD_NOTICE", DefaultThresholdNotice),
@@ -299,6 +327,24 @@ func (c Config) validate() error {
 	}
 	if c.CPAManagementKey == "" {
 		errs = append(errs, "CPA_MANAGEMENT_KEY is required")
+	}
+	if c.QuotaSource != QuotaSourceCPA && c.QuotaSource != QuotaSourceOMC {
+		errs = append(errs, "QUOTA_SOURCE must be cpa or omc")
+	}
+	if c.QuotaSource == QuotaSourceOMC {
+		if c.OMCMCPURL == "" {
+			errs = append(errs, "OMC_MCP_URL is required when QUOTA_SOURCE=omc")
+		} else if u, err := url.Parse(c.OMCMCPURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			// Never echo the URL value: it may embed credentials in a userinfo
+			// component. The setting name is enough to fix it.
+			errs = append(errs, "OMC_MCP_URL must be an absolute http(s) URL")
+		}
+		if c.OMCMCPKey == "" {
+			errs = append(errs, "OMC_MCP_KEY is required when QUOTA_SOURCE=omc")
+		}
+		if c.OMCFallbackAfter < 1 {
+			errs = append(errs, "OMC_FALLBACK_AFTER must be at least 1")
+		}
 	}
 	if c.PollInterval < time.Minute {
 		errs = append(errs, "POLL_INTERVAL must be at least 1m")

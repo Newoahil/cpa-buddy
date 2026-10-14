@@ -23,6 +23,7 @@ func baseEnv(t *testing.T) {
 		"CPA_API_VERSION", "CPA_QUOTA_STRATEGY", "ANTIGRAVITY_QUOTA_PROFILE",
 		"CPA_CONTEXT_OVERRIDES_JSON", "CARD_CHARTS_ENABLED",
 		"COOLDOWN_POLL_INTERVAL", "COOLDOWN_ALERT_AFTER",
+		"QUOTA_SOURCE", "OMC_MCP_URL", "OMC_MCP_KEY", "OMC_FALLBACK_AFTER",
 	} {
 		t.Setenv(k, "")
 	}
@@ -287,5 +288,107 @@ func TestCompatibilityOptionsAndGeminiThreshold(t *testing.T) {
 	}
 	if cfg.CPAAPIVersion != "v0" || cfg.CPAQuotaStrategy != "proxy" || cfg.AntigravityQuotaProfile != "legacy" || cfg.ThresholdsFor(domain.ProviderGeminiCLI).Notice != 80 {
 		t.Fatal("compatibility options not wired")
+	}
+}
+
+// TestQuotaSourceDefaultsToCPA pins the backwards-compatible default: an
+// existing deployment that sets nothing keeps querying CPA directly.
+func TestQuotaSourceDefaultsToCPA(t *testing.T) {
+	baseEnv(t)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.QuotaSource != QuotaSourceCPA {
+		t.Fatalf("QuotaSource = %q, want %q", cfg.QuotaSource, QuotaSourceCPA)
+	}
+	if cfg.OMCFallbackAfter != DefaultOMCFallbackAfter {
+		t.Fatalf("OMCFallbackAfter = %d, want %d", cfg.OMCFallbackAfter, DefaultOMCFallbackAfter)
+	}
+}
+
+func TestQuotaSourceOMCConfigParses(t *testing.T) {
+	baseEnv(t)
+	t.Setenv("QUOTA_SOURCE", "omc")
+	t.Setenv("OMC_MCP_URL", "http://omc:8080/omc/api/mcp")
+	t.Setenv("OMC_MCP_KEY", "read-only-secret")
+	t.Setenv("OMC_FALLBACK_AFTER", "5")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.QuotaSource != QuotaSourceOMC || cfg.OMCMCPURL != "http://omc:8080/omc/api/mcp" || cfg.OMCMCPKey != "read-only-secret" || cfg.OMCFallbackAfter != 5 {
+		t.Fatalf("omc config not wired: %+v", cfg)
+	}
+}
+
+func TestQuotaSourceInvalidRejected(t *testing.T) {
+	baseEnv(t)
+	t.Setenv("QUOTA_SOURCE", "omc-typo")
+	if _, err := Load(); err == nil {
+		t.Fatal("expected error for unknown QUOTA_SOURCE")
+	}
+}
+
+// TestQuotaSourceOMCRequiresEndpointAndKey: opting into OMC without an endpoint
+// or key must fail loudly rather than silently reading nothing.
+func TestQuotaSourceOMCRequiresEndpointAndKey(t *testing.T) {
+	cases := []struct {
+		name    string
+		url     string
+		key     string
+		wantErr bool
+	}{
+		{"missing both", "", "", true},
+		{"missing key", "http://omc:8080/omc/api/mcp", "", true},
+		{"missing url", "", "k", true},
+		{"relative url", "omc:8080/omc/api/mcp", "k", true},
+		{"complete", "http://omc:8080/omc/api/mcp", "k", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			baseEnv(t)
+			t.Setenv("QUOTA_SOURCE", "omc")
+			t.Setenv("OMC_MCP_URL", tc.url)
+			t.Setenv("OMC_MCP_KEY", tc.key)
+			_, err := Load()
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("err = %v, wantErr = %v", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// TestOMCKeyNeverLeaksInErrors: a validation failure must name the setting, not
+// echo the secret value into a log or an operator's terminal.
+func TestOMCKeyNeverLeaksInErrors(t *testing.T) {
+	baseEnv(t)
+	t.Setenv("QUOTA_SOURCE", "omc")
+	t.Setenv("OMC_MCP_URL", "not-a-url")
+	t.Setenv("OMC_MCP_KEY", "super-secret-readonly-key")
+	_, err := Load()
+	if err == nil {
+		t.Fatal("expected error for invalid OMC_MCP_URL")
+	}
+	if strings.Contains(err.Error(), "super-secret-readonly-key") || strings.Contains(err.Error(), "not-a-url") {
+		t.Fatalf("error leaked a secret/url value: %v", err)
+	}
+	if !strings.Contains(err.Error(), "OMC_MCP_URL") {
+		t.Fatalf("error should name the offending setting: %v", err)
+	}
+}
+
+func TestOMCFallbackAfterInvalidRejected(t *testing.T) {
+	baseEnv(t)
+	t.Setenv("QUOTA_SOURCE", "omc")
+	t.Setenv("OMC_MCP_URL", "http://omc:8080/omc/api/mcp")
+	t.Setenv("OMC_MCP_KEY", "k")
+	t.Setenv("OMC_FALLBACK_AFTER", "0")
+	if _, err := Load(); err == nil {
+		t.Fatal("expected error for OMC_FALLBACK_AFTER=0")
+	}
+	t.Setenv("OMC_FALLBACK_AFTER", "many")
+	if _, err := Load(); err == nil {
+		t.Fatal("expected error for a non-integer OMC_FALLBACK_AFTER")
 	}
 }

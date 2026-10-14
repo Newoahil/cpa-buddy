@@ -168,6 +168,38 @@ func Project(q QuotaLevel, c CredentialHealth, f Freshness) domain.CredentialSta
 	}
 }
 
+// Pending status values for PendingItem.Status.
+const (
+	PendingOpen     = "open"
+	PendingResolved = "resolved"
+)
+
+// resolvedPendingRetention is how long a resolved pending item is kept before
+// it is pruned. Keeping it briefly lets the status page and a late summary show
+// that a problem was fixed, without growing the file forever.
+const resolvedPendingRetention = 7 * 24 * time.Hour
+
+// PendingItem is one structured "something needs a human" record
+// (docs/alert-noise-plan.md §4). It is deliberately secret-free: it carries the
+// opaque credential key and the display alias, never a cookie or token.
+//
+// ID is stable across restarts (hash of kind + credential key or provider +
+// scope) so the same ongoing problem never re-alerts after a restart.
+type PendingItem struct {
+	ID       string              `json:"id"`
+	Kind     string              `json:"kind"`
+	Provider domain.ProviderKind `json:"provider,omitempty"`
+	// CredKey is empty for channel-level items.
+	CredKey    string    `json:"cred_key,omitempty"`
+	Alias      string    `json:"alias,omitempty"`
+	Since      time.Time `json:"since"`
+	LastSeen   time.Time `json:"last_seen"`
+	Action     string    `json:"action,omitempty"`
+	Status     string    `json:"status"`
+	NotifiedAt time.Time `json:"notified_at,omitempty"`
+	ResolvedAt time.Time `json:"resolved_at,omitempty"`
+}
+
 // State is the whole persisted document.
 type State struct {
 	Bootstrapped bool                        `json:"bootstrapped"`
@@ -177,6 +209,121 @@ type State struct {
 	// stay queued until the channel confirms delivery, so a transient notifier
 	// failure cannot silently drop an alert.
 	Pending map[string][]domain.Alert `json:"pending,omitempty"`
+	// PendingItems are the structured open/resolved problems. Absent in old
+	// files, which load as nil.
+	PendingItems []PendingItem `json:"pending_items,omitempty"`
+	// QuietQueue holds immediate alerts accumulated while quiet hours are
+	// active, so a restart does not lose them.
+	QuietQueue []domain.Alert `json:"quiet_queue,omitempty"`
+}
+
+// PendingItem returns the item with id and whether it was found.
+func (s *State) PendingItem(id string) (PendingItem, bool) {
+	if s == nil {
+		return PendingItem{}, false
+	}
+	for _, it := range s.PendingItems {
+		if it.ID == id {
+			return it, true
+		}
+	}
+	return PendingItem{}, false
+}
+
+// OpenPending inserts or updates a pending item, preserving Since and
+// NotifiedAt of an existing open item so re-observing a problem never resets
+// its age or re-alerts.
+func (s *State) OpenPending(item PendingItem) {
+	if s == nil || item.ID == "" {
+		return
+	}
+	for i := range s.PendingItems {
+		if s.PendingItems[i].ID != item.ID {
+			continue
+		}
+		prev := s.PendingItems[i]
+		item.Since = prev.Since
+		item.NotifiedAt = prev.NotifiedAt
+		item.Status = PendingOpen
+		item.ResolvedAt = time.Time{}
+		s.PendingItems[i] = item
+		return
+	}
+	if item.Status == "" {
+		item.Status = PendingOpen
+	}
+	s.PendingItems = append(s.PendingItems, item)
+}
+
+// ResolvePending marks an item resolved at now. A missing item is a no-op.
+func (s *State) ResolvePending(id string, now time.Time) {
+	if s == nil {
+		return
+	}
+	for i := range s.PendingItems {
+		if s.PendingItems[i].ID == id && s.PendingItems[i].Status != PendingResolved {
+			s.PendingItems[i].Status = PendingResolved
+			s.PendingItems[i].ResolvedAt = now
+			return
+		}
+	}
+}
+
+// MarkPendingNotified stamps the immediate-push time on an open item.
+func (s *State) MarkPendingNotified(id string, at time.Time) {
+	if s == nil {
+		return
+	}
+	for i := range s.PendingItems {
+		if s.PendingItems[i].ID == id && s.PendingItems[i].Status == PendingOpen {
+			s.PendingItems[i].NotifiedAt = at
+			return
+		}
+	}
+}
+
+// PruneResolved drops resolved items kept longer than resolvedPendingRetention.
+// Open items are never pruned.
+func (s *State) PruneResolved(now time.Time) {
+	if s == nil || len(s.PendingItems) == 0 {
+		return
+	}
+	out := s.PendingItems[:0]
+	for _, it := range s.PendingItems {
+		if it.Status == PendingResolved && !it.ResolvedAt.IsZero() && now.Sub(it.ResolvedAt) > resolvedPendingRetention {
+			continue
+		}
+		out = append(out, it)
+	}
+	// A nil slice stays nil; an empty non-nil slice is normalised away.
+	if len(out) == 0 {
+		s.PendingItems = nil
+		return
+	}
+	s.PendingItems = out
+}
+
+// QueueQuiet appends immediate alerts accumulated during quiet hours. Duplicate
+// pending-item-derived alerts are collapsed by ID so a repeated classification
+// cannot grow the queue without bound.
+func (s *State) QueueQuiet(alerts []domain.Alert) {
+	if s == nil || len(alerts) == 0 {
+		return
+	}
+	s.QuietQueue = append(s.QuietQueue, alerts...)
+	if len(s.QuietQueue) > maxPendingPerChannel {
+		s.QuietQueue = s.QuietQueue[len(s.QuietQueue)-maxPendingPerChannel:]
+	}
+}
+
+// TakeQuiet returns the queued quiet-hours alerts and clears the queue.
+func (s *State) TakeQuiet() []domain.Alert {
+	if s == nil || len(s.QuietQueue) == 0 {
+		return nil
+	}
+	out := append([]domain.Alert(nil), s.QuietQueue...)
+	s.QuietQueue = nil
+	return out
 }
 
 // QueuePending appends alerts to each named channel's outbox. A channel keeps

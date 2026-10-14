@@ -269,6 +269,117 @@ func TestPendingRoundTrip(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Pending items and the quiet-hours queue
+// ---------------------------------------------------------------------------
+
+func TestPendingItemRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	store := NewFileStore(path)
+	st := Empty()
+	st.Bootstrapped = true
+	st.OpenPending(PendingItem{
+		ID: "credential_invalid:abc", Kind: "credential_invalid",
+		Provider: domain.ProviderClaude, CredKey: "claude-1", Alias: "claude-1",
+		Action: "重新登录", Status: PendingOpen,
+	})
+	if err := store.Save(st); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	it, ok := got.PendingItem("credential_invalid:abc")
+	if !ok || it.Provider != domain.ProviderClaude || it.CredKey != "claude-1" {
+		t.Fatalf("pending item lost in round trip: %+v", got.PendingItems)
+	}
+}
+
+// TestOpenPendingPreservesSinceAndNotified checks that re-observing an ongoing
+// problem never resets its age or re-arms its notification.
+func TestOpenPendingPreservesSinceAndNotified(t *testing.T) {
+	st := Empty()
+	since := time.Date(2026, 10, 1, 9, 0, 0, 0, time.UTC)
+	notified := since.Add(time.Minute)
+	st.PendingItems = []PendingItem{{ID: "x", Kind: "monitor_down", Since: since, NotifiedAt: notified, Status: PendingOpen}}
+	st.OpenPending(PendingItem{ID: "x", Kind: "monitor_down", LastSeen: since.Add(time.Hour)})
+	it, _ := st.PendingItem("x")
+	if !it.Since.Equal(since) {
+		t.Errorf("Since reset: %v want %v", it.Since, since)
+	}
+	if !it.NotifiedAt.Equal(notified) {
+		t.Errorf("NotifiedAt reset: %v want %v", it.NotifiedAt, notified)
+	}
+}
+
+func TestResolvePendingAndPrune(t *testing.T) {
+	st := Empty()
+	now := time.Date(2026, 10, 14, 12, 0, 0, 0, time.UTC)
+	st.PendingItems = []PendingItem{
+		{ID: "old", Status: PendingResolved, ResolvedAt: now.Add(-8 * 24 * time.Hour)},
+		{ID: "recent", Status: PendingResolved, ResolvedAt: now.Add(-1 * time.Hour)},
+		{ID: "open", Status: PendingOpen, Since: now.Add(-100 * time.Hour)},
+	}
+	st.PruneResolved(now)
+	if _, ok := st.PendingItem("old"); ok {
+		t.Error("resolved item older than 7 days should be pruned")
+	}
+	if _, ok := st.PendingItem("recent"); !ok {
+		t.Error("recently resolved item must be kept")
+	}
+	if _, ok := st.PendingItem("open"); !ok {
+		t.Error("open item must never be pruned")
+	}
+
+	st.ResolvePending("open", now)
+	it, _ := st.PendingItem("open")
+	if it.Status != PendingResolved || !it.ResolvedAt.Equal(now) {
+		t.Errorf("resolve failed: %+v", it)
+	}
+}
+
+func TestQuietQueueRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	store := NewFileStore(path)
+	st := Empty()
+	st.QueueQuiet([]domain.Alert{{Kind: domain.AlertCredential, Title: "a"}})
+	if err := store.Save(st); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	queued := got.TakeQuiet()
+	if len(queued) != 1 || queued[0].Title != "a" {
+		t.Fatalf("quiet queue lost: %+v", got.QuietQueue)
+	}
+	if again := got.TakeQuiet(); again != nil {
+		t.Fatalf("TakeQuiet must clear the queue, got %+v", again)
+	}
+}
+
+// TestOldStateFileLoadsWithoutNewFields is the compatibility check: a state
+// file written before pending items existed must load cleanly.
+func TestOldStateFileLoadsWithoutNewFields(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	legacy := `{"bootstrapped":true,"updated_at":"2026-10-01T00:00:00Z","credentials":{"claude-1":{"state":"healthy"}}}`
+	if err := os.WriteFile(path, []byte(legacy), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	st, err := NewFileStore(path).Load()
+	if err != nil {
+		t.Fatalf("legacy file must load: %v", err)
+	}
+	if !st.Bootstrapped || len(st.Credentials) != 1 {
+		t.Fatalf("legacy fields lost: %+v", st)
+	}
+	if st.PendingItems != nil || st.QuietQueue != nil {
+		t.Errorf("new fields should default to nil, got %+v / %+v", st.PendingItems, st.QuietQueue)
+	}
+}
+
 func TestProjectPriority(t *testing.T) {
 	cases := []struct {
 		name string

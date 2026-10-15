@@ -355,3 +355,50 @@ func TestOMCCollectorEndToEnd(t *testing.T) {
 		t.Fatalf("quota must come from OMC: %+v", s)
 	}
 }
+
+// TestFallbackOutageSinceTracksFirstFailureAndClears covers the OMC outage
+// signal: the first failure of a run opens the outage, only the declared
+// providers are outaged, RestoreOutage only bridges the start earlier, and
+// recovery clears it.
+func TestFallbackOutageSinceTracksFirstFailureAndClears(t *testing.T) {
+	primary := &fakeCollector{name: "omc", err: errors.New("omc down")}
+	fb := NewFallbackCollector(primary, &fakeCollector{name: "cpa"}, 3, nil)
+	fb.SetOutageProviders(domain.ProviderCodex, domain.ProviderClaude)
+	start := time.Date(2026, 10, 14, 9, 0, 0, 0, time.UTC)
+	fb.now = func() time.Time { return start }
+
+	if _, active := fb.OutageSince(domain.ProviderCodex, start); active {
+		t.Fatal("no outage before any failure")
+	}
+	if _, err := fb.Collect(context.Background()); err == nil {
+		t.Fatal("first failure must surface as an error below the threshold")
+	}
+	since, active := fb.OutageSince(domain.ProviderCodex, start)
+	if !active || !since.Equal(start) {
+		t.Fatalf("outage since=%v active=%v, want %v true", since, active, start)
+	}
+	if _, active := fb.OutageSince(domain.ProviderOllama, start); active {
+		t.Fatal("a provider this source does not speak for must not be outaged")
+	}
+
+	earlier := start.Add(-2 * time.Hour)
+	fb.RestoreOutage(earlier)
+	if since, _ := fb.OutageSince(domain.ProviderCodex, start); !since.Equal(earlier) {
+		t.Fatalf("RestoreOutage did not bridge the start: %v", since)
+	}
+	fb.RestoreOutage(start.Add(time.Hour)) // later: must be ignored
+	if since, _ := fb.OutageSince(domain.ProviderCodex, start); !since.Equal(earlier) {
+		t.Fatalf("RestoreOutage moved the start later: %v", since)
+	}
+
+	primary.err = nil
+	if _, err := fb.Collect(context.Background()); err != nil {
+		t.Fatalf("recovery Collect: %v", err)
+	}
+	if _, active := fb.OutageSince(domain.ProviderCodex, start); active {
+		t.Fatal("outage must clear on recovery")
+	}
+	if !fb.OutageStart().IsZero() {
+		t.Fatal("OutageStart must be zero after recovery")
+	}
+}

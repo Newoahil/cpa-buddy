@@ -136,6 +136,9 @@ func run(log *slog.Logger) error {
 		// While the OMC source is failing and we read CPA directly, keep the
 		// regular interval so the fallback does not accelerate upstream queries.
 		application.SetFallbackActive(fallback.InFallback)
+		// A sustained OMC outage becomes a pending omc_outage item (never an
+		// immediate push); the app persists its start across restarts.
+		application.SetOutageSource(fallback)
 	}
 	log.Info("quota source configured", "source", cfg.QuotaSource, "omc_fallback_after", cfg.OMCFallbackAfter)
 	// The rate-limit cooldown watcher polls only the credential list, through

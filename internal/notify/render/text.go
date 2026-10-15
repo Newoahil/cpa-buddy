@@ -37,6 +37,9 @@ func (r *Renderer) Text(msg domain.Message) string {
 		b.WriteString(msg.Body)
 		b.WriteByte('\n')
 	}
+	if msg.Actionable != nil {
+		b.WriteString(r.actionableText(msg.Actionable))
+	}
 
 	if msg.Report != nil && len(msg.Report.Providers) > 0 {
 		b.WriteString(r.textProviders(msg.Report, msg.Detailed))

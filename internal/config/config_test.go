@@ -24,8 +24,121 @@ func baseEnv(t *testing.T) {
 		"CPA_CONTEXT_OVERRIDES_JSON", "CARD_CHARTS_ENABLED",
 		"COOLDOWN_POLL_INTERVAL", "COOLDOWN_ALERT_AFTER",
 		"QUOTA_SOURCE", "OMC_MCP_URL", "OMC_MCP_KEY", "OMC_FALLBACK_AFTER",
+		"ALERT_MODE", "CHANNEL_UNAVAILABLE_AFTER", "MONITOR_DOWN_AFTER",
+		"OMC_OUTAGE_PENDING_AFTER", "QUIET_HOURS", "SUMMARY_TIGHT_REMAINING",
 	} {
 		t.Setenv(k, "")
+	}
+}
+
+func TestAlertNoiseDefaults(t *testing.T) {
+	baseEnv(t)
+	// baseEnv clears QUIET_HOURS, so restore the default explicitly.
+	t.Setenv("QUIET_HOURS", DefaultQuietHours)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.AlertMode != AlertModeActionable {
+		t.Errorf("AlertMode = %q, want actionable", cfg.AlertMode)
+	}
+	if cfg.ChannelUnavailableAfter != 30*time.Minute || cfg.MonitorDownAfter != 30*time.Minute {
+		t.Errorf("durations = %v / %v", cfg.ChannelUnavailableAfter, cfg.MonitorDownAfter)
+	}
+	if cfg.OMCOutagePendingAfter != 2*time.Hour {
+		t.Errorf("OMCOutagePendingAfter = %v", cfg.OMCOutagePendingAfter)
+	}
+	if cfg.SummaryTightRemaining != 20 {
+		t.Errorf("SummaryTightRemaining = %v", cfg.SummaryTightRemaining)
+	}
+	if !cfg.QuietHours.Set || cfg.QuietHours.Start != 23*60 || cfg.QuietHours.End != 8*60 {
+		t.Errorf("QuietHours = %+v", cfg.QuietHours)
+	}
+}
+
+func TestAlertNoiseValuesParse(t *testing.T) {
+	baseEnv(t)
+	t.Setenv("ALERT_MODE", "legacy")
+	t.Setenv("CHANNEL_UNAVAILABLE_AFTER", "1h")
+	t.Setenv("MONITOR_DOWN_AFTER", "45m")
+	t.Setenv("OMC_OUTAGE_PENDING_AFTER", "90m")
+	t.Setenv("QUIET_HOURS", "01:30-06:15")
+	t.Setenv("SUMMARY_TIGHT_REMAINING", "35")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.AlertMode != AlertModeLegacy || cfg.ChannelUnavailableAfter != time.Hour ||
+		cfg.MonitorDownAfter != 45*time.Minute || cfg.OMCOutagePendingAfter != 90*time.Minute ||
+		cfg.SummaryTightRemaining != 35 {
+		t.Fatalf("values not wired: %+v", cfg)
+	}
+	if !cfg.QuietHours.Set || cfg.QuietHours.Start != 90 || cfg.QuietHours.End != 375 {
+		t.Fatalf("quiet hours = %+v", cfg.QuietHours)
+	}
+}
+
+func TestEmptyQuietHoursDisables(t *testing.T) {
+	baseEnv(t)
+	t.Setenv("QUIET_HOURS", "")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.QuietHours.Set {
+		t.Errorf("empty QUIET_HOURS must disable quiet hours, got %+v", cfg.QuietHours)
+	}
+}
+
+func TestAlertNoiseInvalidValuesRejected(t *testing.T) {
+	cases := []struct{ key, value string }{
+		{"ALERT_MODE", "loud"},
+		{"CHANNEL_UNAVAILABLE_AFTER", "soon"},
+		{"CHANNEL_UNAVAILABLE_AFTER", "0"},
+		{"MONITOR_DOWN_AFTER", "-5m"},
+		{"OMC_OUTAGE_PENDING_AFTER", "later"},
+		{"QUIET_HOURS", "23:00"},
+		{"QUIET_HOURS", "25:00-08:00"},
+		{"QUIET_HOURS", "aa:bb-cc:dd"},
+		{"SUMMARY_TIGHT_REMAINING", "101"},
+		{"SUMMARY_TIGHT_REMAINING", "-1"},
+		{"SUMMARY_TIGHT_REMAINING", "high"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.key+"="+tc.value, func(t *testing.T) {
+			baseEnv(t)
+			t.Setenv(tc.key, tc.value)
+			if _, err := Load(); err == nil {
+				t.Fatalf("expected error for %s=%q", tc.key, tc.value)
+			}
+		})
+	}
+}
+
+func TestQuietWindowContains(t *testing.T) {
+	cross, err := ParseQuietHours("23:00-08:00")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		hour, min int
+		want      bool
+	}{
+		{23, 30, true}, {0, 0, true}, {7, 59, true},
+		{8, 0, false}, {12, 0, false}, {22, 59, false},
+	}
+	for _, tc := range cases {
+		at := time.Date(2026, 10, 14, tc.hour, tc.min, 0, 0, time.UTC)
+		if got := cross.Contains(at); got != tc.want {
+			t.Errorf("23:00-08:00 contains %02d:%02d = %v, want %v", tc.hour, tc.min, got, tc.want)
+		}
+	}
+	same, err := ParseQuietHours("00:00-00:00")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if same.Set {
+		t.Error("zero-length window should be disabled")
 	}
 }
 

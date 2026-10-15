@@ -118,6 +118,28 @@ type Config struct {
 	// QuotaIgnoredGroups lists model/group scopes to exclude from notifications.
 	QuotaIgnoredGroups []string
 
+	// Alert noise policy (docs/alert-noise-plan.md §5).
+	//
+	// AlertMode is "actionable" (default) or "legacy". Legacy reproduces the old
+	// behaviour exactly and exists only as a rollback switch; it is removed once
+	// the new behaviour is stable.
+	AlertMode string
+	// ChannelUnavailableAfter: alert only when a channel's earliest account
+	// recovery lies further ahead than this.
+	ChannelUnavailableAfter time.Duration
+	// MonitorDownAfter: alert only after a channel has had no valid data for
+	// longer than this.
+	MonitorDownAfter time.Duration
+	// OMCOutagePendingAfter: list an OMC fallback outage as pending only after
+	// it has lasted longer than this. Reserved for feat/omc-quota-source.
+	OMCOutagePendingAfter time.Duration
+	// QuietHours suppresses all immediate pushes inside the window. Empty
+	// disables quiet hours. Evaluated in the configured Location.
+	QuietHours QuietWindow
+	// SummaryTightRemaining is the remaining percentage below which a channel
+	// counts as tight for the scheduled summary.
+	SummaryTightRemaining float64
+
 	// Scheduling.
 	Location     *time.Location
 	SummaryTimes []string
@@ -168,7 +190,80 @@ const (
 	// DefaultOMCFallbackAfter is how many consecutive OMC failures trigger a
 	// direct CPA fallback: one hiccup is not enough to bypass OMC.
 	DefaultOMCFallbackAfter = 3
+
+	// Actionable alerting defaults (docs/alert-noise-plan.md §5).
+	AlertModeActionable = "actionable"
+	AlertModeLegacy     = "legacy"
+	// DefaultChannelUnavailableAfter is how far ahead the earliest account
+	// recovery must lie for a channel to count as unavailable.
+	DefaultChannelUnavailableAfter = 30 * time.Minute
+	// DefaultMonitorDownAfter is how long a channel may lack valid data before
+	// it counts as down.
+	DefaultMonitorDownAfter = 30 * time.Minute
+	// DefaultOMCOutagePendingAfter is when an OMC fallback outage becomes a
+	// pending item (never an immediate push).
+	DefaultOMCOutagePendingAfter = 2 * time.Hour
+	// DefaultQuietHours is the default no-push window. Cross-midnight is fine.
+	DefaultQuietHours = "23:00-08:00"
+	// DefaultSummaryTightRemaining is the remaining percentage below which a
+	// channel counts as tight for the summary decision.
+	DefaultSummaryTightRemaining = 20.0
 )
+
+// QuietWindow is a time-of-day window during which immediate pushes are held
+// back. It is expressed in minutes since midnight so it can cross midnight
+// (start > end). Set=false means quiet hours are disabled.
+type QuietWindow struct {
+	Start int
+	End   int
+	Set   bool
+}
+
+// ParseQuietHours parses "HH:MM-HH:MM". An empty string disables quiet hours. A
+// window whose start equals its end is treated as disabled (a zero-length or
+// all-day window is ambiguous; neither is intended).
+func ParseQuietHours(raw string) (QuietWindow, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return QuietWindow{}, nil
+	}
+	parts := strings.SplitN(raw, "-", 2)
+	if len(parts) != 2 {
+		return QuietWindow{}, fmt.Errorf("QUIET_HOURS %q must be HH:MM-HH:MM", raw)
+	}
+	start, err := parseClock(parts[0])
+	if err != nil {
+		return QuietWindow{}, fmt.Errorf("QUIET_HOURS start: %w", err)
+	}
+	end, err := parseClock(parts[1])
+	if err != nil {
+		return QuietWindow{}, fmt.Errorf("QUIET_HOURS end: %w", err)
+	}
+	return QuietWindow{Start: start, End: end, Set: start != end}, nil
+}
+
+func parseClock(s string) (int, error) {
+	s = strings.TrimSpace(s)
+	t, err := time.Parse("15:04", s)
+	if err != nil {
+		return 0, fmt.Errorf("%q is not HH:MM", s)
+	}
+	return t.Hour()*60 + t.Minute(), nil
+}
+
+// Contains reports whether t falls inside the window. The caller passes t in
+// the configured zone; only the wall clock matters.
+func (q QuietWindow) Contains(t time.Time) bool {
+	if !q.Set {
+		return false
+	}
+	m := t.Hour()*60 + t.Minute()
+	if q.Start < q.End {
+		return m >= q.Start && m < q.End
+	}
+	// Cross-midnight: the window wraps around 00:00.
+	return m >= q.Start || m < q.End
+}
 
 // Load reads configuration from the process environment and validates it.
 //
@@ -215,6 +310,14 @@ func Load() (Config, error) {
 	cfg.OMCMCPURL = env("OMC_MCP_URL", "")
 	cfg.OMCMCPKey = env("OMC_MCP_KEY", "")
 	cfg.OMCFallbackAfter = mustInt(&errs, "OMC_FALLBACK_AFTER", DefaultOMCFallbackAfter)
+
+	// Alert noise policy.
+	cfg.AlertMode = env("ALERT_MODE", AlertModeActionable)
+	cfg.ChannelUnavailableAfter = mustDuration(&errs, "CHANNEL_UNAVAILABLE_AFTER", DefaultChannelUnavailableAfter)
+	cfg.MonitorDownAfter = mustDuration(&errs, "MONITOR_DOWN_AFTER", DefaultMonitorDownAfter)
+	cfg.OMCOutagePendingAfter = mustDuration(&errs, "OMC_OUTAGE_PENDING_AFTER", DefaultOMCOutagePendingAfter)
+	cfg.SummaryTightRemaining = mustFloat(&errs, "SUMMARY_TIGHT_REMAINING", DefaultSummaryTightRemaining)
+	cfg.QuietHours = mustQuietHours(&errs, "QUIET_HOURS", DefaultQuietHours)
 
 	cfg.DefaultThresholds = Thresholds{
 		Notice: mustFloat(&errs, "QUOTA_THRESHOLD_NOTICE", DefaultThresholdNotice),
@@ -352,6 +455,12 @@ func (c Config) validate() error {
 	if c.FastPollInterval != 0 && c.FastPollInterval < time.Minute {
 		errs = append(errs, "FAST_POLL_INTERVAL must be 0 (disabled) or at least 1m")
 	}
+	if c.AlertMode != AlertModeActionable && c.AlertMode != AlertModeLegacy {
+		errs = append(errs, "ALERT_MODE must be actionable or legacy")
+	}
+	if c.SummaryTightRemaining < 0 || c.SummaryTightRemaining > 100 {
+		errs = append(errs, "SUMMARY_TIGHT_REMAINING must be between 0 and 100")
+	}
 	if c.CooldownPollInterval != 0 && c.CooldownPollInterval < MinCooldownPollInterval {
 		errs = append(errs, "COOLDOWN_POLL_INTERVAL must be 0 (disabled) or at least 15s")
 	}
@@ -481,6 +590,22 @@ func mustBool(errs *[]string, key string, def bool) bool {
 		return def
 	}
 	return v
+}
+
+// mustQuietHours parses QUIET_HOURS. Unlike env(), an explicitly empty value
+// disables quiet hours rather than falling back to the default, so the operator
+// can turn it off. A malformed value is recorded as an error.
+func mustQuietHours(errs *[]string, key, def string) QuietWindow {
+	raw, ok := os.LookupEnv(key)
+	if !ok {
+		raw = def
+	}
+	q, err := ParseQuietHours(raw)
+	if err != nil {
+		*errs = append(*errs, err.Error())
+		return QuietWindow{}
+	}
+	return q
 }
 
 func splitList(raw string) []string {

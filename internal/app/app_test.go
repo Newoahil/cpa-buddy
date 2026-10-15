@@ -108,10 +108,19 @@ func (m *memStore) Save(st *state.State) error {
 
 func cloneState(in *state.State) *state.State {
 	out := &state.State{
-		Bootstrapped: in.Bootstrapped,
-		UpdatedAt:    in.UpdatedAt,
-		Credentials:  map[string]state.CredentialRecord{},
-		Pending:      map[string][]domain.Alert{},
+		Bootstrapped:   in.Bootstrapped,
+		UpdatedAt:      in.UpdatedAt,
+		Credentials:    map[string]state.CredentialRecord{},
+		Pending:        map[string][]domain.Alert{},
+		PendingItems:   append([]state.PendingItem(nil), in.PendingItems...),
+		QuietQueue:     append([]domain.Alert(nil), in.QuietQueue...),
+		OMCOutageSince: in.OMCOutageSince,
+	}
+	if in.ChannelTracks != nil {
+		out.ChannelTracks = make(map[domain.ProviderKind]state.ChannelTrack, len(in.ChannelTracks))
+		for k, v := range in.ChannelTracks {
+			out.ChannelTracks[k] = v
+		}
 	}
 	for k, v := range in.Credentials {
 		out.Credentials[k] = v
@@ -123,11 +132,14 @@ func cloneState(in *state.State) *state.State {
 }
 
 func testConfig() config.Config {
+	// The existing tests all describe the legacy behaviour; the actionable mode
+	// has its own app tests with an explicit config.
 	return config.Config{
 		PollInterval:       time.Minute,
 		StaleAfterFailures: 2,
 		AnomalyConsecutive: 3,
 		CooldownAlertAfter: 5 * time.Minute,
+		AlertMode:          config.AlertModeLegacy,
 	}
 }
 

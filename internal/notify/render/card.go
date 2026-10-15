@@ -117,9 +117,13 @@ func (r *Renderer) cardHeader(msg domain.Message) map[string]any {
 			title = "限流冷却中 (时间较长)"
 		}
 	}
+	template := r.cardColor(msg)
+	if msg.Actionable != nil && msg.Actionable.HeaderColor != "" {
+		template = msg.Actionable.HeaderColor
+	}
 	return map[string]any{
 		"title":    map[string]any{"tag": "plain_text", "content": title},
-		"template": r.cardColor(msg),
+		"template": template,
 	}
 }
 
@@ -147,6 +151,11 @@ func brandTagColor(p domain.ProviderKind) string {
 
 // cardElements assembles the body under the component budget.
 func (r *Renderer) cardElements(msg domain.Message, full, charts bool) []any {
+	// The actionable-mode summary carries its own view model; its absence is
+	// what keeps every legacy card pixel-identical.
+	if msg.Actionable != nil {
+		return r.actionableSummaryElements(msg, full)
+	}
 	// Every card — full or fallback, query or alert — is built from the same
 	// blocks; the fallback only drops the collapsible panel.
 	if isAlertNotice(msg) {

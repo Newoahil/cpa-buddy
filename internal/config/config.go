@@ -88,6 +88,7 @@ type Config struct {
 	DefaultThresholds  Thresholds
 	ProviderThresholds map[domain.ProviderKind]Thresholds
 	StaleAfterFailures int
+	ModelProfiles      []ModelProfile
 
 	// Anomaly attribution for plain timeouts.
 	AnomalyConsecutive int
@@ -341,6 +342,10 @@ func Load() (Config, error) {
 	}
 
 	cfg.ProviderThresholds, err = parseProviderThresholds(env("QUOTA_THRESHOLDS_JSON", ""), cfg.DefaultThresholds)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.ModelProfiles, err = ParseModelProfiles(env("MODEL_PROFILES_JSON", ""))
 	if err != nil {
 		return Config{}, err
 	}
